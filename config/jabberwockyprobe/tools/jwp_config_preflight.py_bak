@@ -1,0 +1,2049 @@
+#!/usr/bin/env python3
+"""Read-only Klipper configuration preflight and hygiene scrubber for Jabberwocky Probe 2.0.
+Author / Created by: Kinematicdigit (Jabberwocky Team)
+Project home: https://github.com/kinematicdigit/jabberwockyprobe1.2
+
+This intentionally runs outside Klipper. A gcode macro cannot run when a
+duplicate section or command prevents Klipper from loading the configuration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import sys
+import textwrap
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+# Bump SCRIPT_REVISION and SCRIPT_REVISION_DATE together whenever this file
+# changes -- printed at the top of every report so a user can tell which
+# scanner build produced a given report (e.g. when comparing bench notes
+# or filing an issue against a specific behavior).
+SCRIPT_REVISION = "r19"
+SCRIPT_REVISION_DATE = "2026-09-19"
+SCRIPT_AUTHOR = "Kinematicdigit (Jabberwocky Team)"
+SCRIPT_PROJECT_URL = "https://github.com/kinematicdigit/jabberwockyprobe1.2"
+
+SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*(?:[#;].*)?$")
+INCLUDE_RE = re.compile(r"^\s*\[include\s+([^\]]+)\]\s*(?:[#;].*)?$", re.I)
+DISABLED_INCLUDE_RE = re.compile(r"^\s*[#;]+\s*\[include\s+([^\]]+)\]\s*$", re.I)
+OPTION_RE = re.compile(r"^\s*([A-Za-z_][\w-]*)\s*:")
+MACRO_RE = re.compile(r"^\s*\[gcode_macro\s+([^\]]+)\]\s*$", re.I)
+PIN_OPTION_RE = re.compile(r"^(?:.*_pin|pin)$", re.I)
+VIRTUAL_PINS = {"virtual_endstop", "probe:z_virtual_endstop", "none", "nil"}
+
+# Klipper's auto-generated SAVE_CONFIG block prefixes every line with
+# "#*#" and writes options as "key = value" (not "key: value" like a
+# hand-authored section) -- both need their own regex since the block is
+# otherwise indistinguishable from a plain comment to a naive scanner.
+SAVE_CONFIG_CONTENT_RE = re.compile(r"^\s*#\*#\s?(.*)$")
+SAVE_CONFIG_OPTION_RE = re.compile(r"^\s*([A-Za-z_][\w-]*)\s*=\s*(.*)$")
+
+RENAME_RE = re.compile(r"^\s*rename_existing\s*:\s*(\S+)", re.I)
+
+INTERESTING_SECTIONS = {
+    "probe",
+    "extruder",
+    "quad_gantry_level",
+    "z_tilt",
+    "bed_mesh",
+    "safe_z_home",
+    "homing_override",
+    "mcu nhk",
+    "stepper_x",
+    "stepper_y",
+    "stepper_z",
+}
+LEGACY_MACROS = {
+    "attach_probe",
+    "dock_probe",
+    "undock_probe",
+    "deploy_probe",
+    "retract_probe",
+    "quad_gantry_level",
+    "z_tilt_adjust",
+    "bed_mesh_calibrate",
+    "calibrate_z",
+}
+
+# Public onboarding commands required by the current five-step workflow.
+# Check these only when the JWP master include is active; otherwise the
+# scrubber is evaluating a pre-install configuration where absence is expected.
+JWP_REQUIRED_ONBOARDING_MACROS = {
+    "jwp_setup_wizard": "Step 0 machine-profile detection",
+    "jwp_release_for_dock_clearance": "explicit Step 1 motor release and clearance handshake",
+    "jwp_auto_align_dock": "Step 1 physical tine discovery",
+    "jwp_align_autoz_switch": "Step 2 Auto-Z switch alignment",
+    "jwp_verify_autoz_switch_location": "Step 2 physical switch verification",
+    "jwp_test_repeatability": "Step 3 repeatability measurement",
+    "jwp_confirm_repeatability": "Step 3 repeatability confirmation",
+    "jwp_measure_probe_nozzle_offset": "Step 4 fixed probe/nozzle measurement",
+    "calibrate_z": "Auto-Z calibration required before Step 5",
+    "jwp_align_bed_envelope": "Step 5 installed-bed corner verification",
+    "jwp_generate_leveling_config": "Step 5 native leveling/mesh generator",
+}
+
+OTHER_PROBE_SECTIONS = {
+    "cartographer": "Cartographer probe/eddy sensor",
+    "beacon": "Beacon surface scanner/probe",
+    "bltouch": "BLTouch probe",
+    "microprobe": "BTT MicroProbe",
+    "smart_effector": "Smart Effector probe",
+    "adxl345 probe": "ADXL-based nozzle probe (e.g. Voron TAP / nozzle tap sensor)",
+}
+
+OTHER_PROBE_INCLUDE_PATTERNS = [
+    (re.compile(r"cartographer", re.I), "Cartographer Probe"),
+    (re.compile(r"beacon", re.I), "Beacon Probe"),
+    (re.compile(r"tap(?:\.cfg|_probe|\b)", re.I), "Voron TAP"),
+    (re.compile(r"klicky", re.I), "Klicky Probe"),
+    (re.compile(r"euclid", re.I), "Euclid Probe"),
+    (re.compile(r"unclicky", re.I), "Unklicky Probe"),
+    (re.compile(r"microprobe", re.I), "BTT MicroProbe"),
+    (re.compile(r"bltouch", re.I), "BLTouch Probe"),
+    (re.compile(r"eddy", re.I), "BTT Eddy Sensor"),
+    (re.compile(r"btt_eddy", re.I), "BTT Eddy Sensor"),
+    (re.compile(r"klack", re.I), "KlackEnder / Klack Probe"),
+    (re.compile(r"quickdraw", re.I), "QuickDraw Probe"),
+]
+
+# G-code commands that bypass Klipper's normal kinematic limits, homing
+# state, or position tracking. Klipper's own docs mark these as intended
+# for manual bench calibration/debugging only -- leaving them wired into
+# a macro that runs automatically (print-start, homing overrides, probe
+# alignment, etc.) is a common source of crashed toolheads or silently
+# wrong position tracking, and often a leftover from bench-testing that
+# never got cleaned up.
+RISKY_GCODE_COMMANDS = [
+    (
+        re.compile(r"^\s*FORCE_MOVE\b", re.I),
+        "FORCE_MOVE",
+        "Bypasses kinematic limits, homing state, and endstop checks entirely -- a wrong axis/distance can slam the toolhead into a hard stop. Intended for manual bench calibration only; should not remain in a macro that runs automatically.",
+    ),
+    (
+        re.compile(r"^\s*SET_KINEMATIC_POSITION\b", re.I),
+        "SET_KINEMATIC_POSITION",
+        "Overwrites Klipper's internal position without physically confirming it -- if the assumed position is wrong, every move afterward is wrong too. Should only ever be run manually, immediately after visually confirming the real position, never inside an automatic macro.",
+    ),
+    (
+        re.compile(r"^\s*STEPPER_BUZZ\b", re.I),
+        "STEPPER_BUZZ",
+        "Jogs a single stepper back and forth to identify wiring/direction during bring-up. Left inside a macro that runs automatically it serves no purpose during normal operation and is a sign of leftover debug/bench-testing code.",
+    ),
+    (
+        re.compile(r"^\s*SET_STEPPER\b", re.I),
+        "SET_STEPPER",
+        "Low-level manual stepper enable/disable override for debugging. Unexpectedly disabling a stepper mid-macro can silently lose position; not intended for use inside production macros.",
+    ),
+    (
+        re.compile(r"^\s*M302\b.*\bP\s*1\b", re.I),
+        "M302 P1 (Cold Extrusion Override)",
+        "Disables the extruder's min_extrude_temp safety check, letting the extruder motor drive filament with a cold/unheated hotend. Useful for a manual filament-load routine, but left enabled (or fired automatically) it risks grinding filament or a clogged/underheated nozzle -- verify this only runs when the operator explicitly asks for it, not on every print-start.",
+    ),
+]
+
+# TMC driver current sanity bounds (Amps). Klipper expects run_current /
+# hold_current in Amps, not milliamps -- pasting a datasheet mA value
+# (e.g. 1500) straight into the config is a common copy/paste mistake.
+TMC_MAX_REASONABLE_CURRENT = 6.0
+
+# Klipper's own documentation/example configs show these exact Kp/Ki/Kd
+# numbers as filler for `control: pid`. Finding them unchanged in a live
+# config is a strong signal that PID_CALIBRATE was never actually run for
+# that heater (or the tuned values were lost/never saved).
+PID_PLACEHOLDER_VALUES = {"pid_kp": 1.0, "pid_ki": 0.5, "pid_kd": 2.0}
+
+# Sections Klipper legitimately writes to the SAVE_CONFIG block with no
+# corresponding manually-authored [section] -- flagging these as
+# "orphaned" would be a false positive on every normal install.
+SAVE_CONFIG_ONLY_WHITELIST = {"input_shaper", "axis_twist_compensation", "printer", "gcode_arcs"}
+
+# Macro-name groupings for the print/pause/cancel lifecycle check below.
+# PRINT_START/START_PRINT begin a job. PRINT_END/END_PRINT/CANCEL_PRINT
+# genuinely finish one -- heaters, fans, and steppers should all end up
+# released (eventually, if not immediately). PAUSE/M600 are resumable:
+# heaters should intentionally stay hot and steppers must NOT be
+# disabled, or RESUME can't safely continue from the tracked position.
+PRINT_START_MACRO_NAMES = {"print_start", "start_print"}
+PRINT_TERMINAL_MACRO_NAMES = {"print_end", "end_print", "cancel_print"}
+PRINT_PAUSE_MACRO_NAMES = {"pause", "m600"}
+
+# G-code/macro calls that only exist if the corresponding optional
+# plugin/module/macro is actually configured on this printer. Calling one
+# unconditionally is fine on the machine it was written for, but raises
+# "Unknown command"/"Unknown extended command" the moment the same macro
+# is reused (or shared) on a printer without that module -- and is easy
+# to miss because the config still loads and *looks* fine at a glance.
+OPTIONAL_HARDWARE_CALLS = [
+    (re.compile(r"^\s*MMU_END\b", re.I), "MMU_END", "'mmu' in printer or 'MMU_END' in printer"),
+    (re.compile(r"^\s*CARTOGRAPHER_TOUCH\b", re.I), "CARTOGRAPHER_TOUCH", "'scanner' in printer"),
+    (re.compile(r"^\s*set_case_light_(?:on|off)\b", re.I), "set_case_light_on/off", "'set_case_light_on' in printer"),
+    (re.compile(r"^\s*status_[a-z_]+\b", re.I), "status_* LED macro", "'status_<name>' in printer"),
+    (re.compile(r"^\s*START_IDLE_RAINBOW\b", re.I), "START_IDLE_RAINBOW", "'START_IDLE_RAINBOW' in printer"),
+]
+
+# Bracket/curly placeholder tokens that are only ever meaningful *inside a
+# slicer's own custom-gcode text box* -- the slicer substitutes them with
+# a real number before the g-code is ever sent to Klipper. Finding one
+# literally inside a .cfg file is almost always leftover from
+# copy/pasting a slicer wiki example into the wrong place: Klipper will
+# either pass it through as garbage, or -- if it's ever uncommented at
+# the very start of a line -- misparse it as a brand-new [section] header.
+SLICER_PLACEHOLDER_PATTERNS = [
+    (re.compile(r"\[(?:nozzle|bed|first_layer|initial_layer)[a-z_]*(?:temp|temperature)[a-z_]*\]", re.I),
+     "PrusaSlicer / SuperSlicer / OrcaSlicer"),
+    (re.compile(r"\[(?:bed_mesh_algo|adaptive_bed_mesh_(?:min|max)|bed_mesh_probe_count)\]", re.I),
+     "PrusaSlicer / SuperSlicer / OrcaSlicer adaptive-mesh helper variable"),
+    (re.compile(r"\{material_(?:print|bed)_temperature[a-z_]*\}", re.I), "Cura"),
+]
+
+# Legacy Marlin/RepRapFirmware commands that a slicer's own Start/End
+# G-code text box commonly sends, but that Klipper does not implement
+# natively. If one shows up literally inside a PRINT_START/START_PRINT/
+# PRINT_END/END_PRINT/CANCEL_PRINT macro body -- as opposed to living
+# only in the slicer's own custom-gcode box, which this scanner can never
+# see -- Klipper raises "Unknown command" the instant that line runs and
+# aborts the print/end sequence, unless the user has also defined a
+# matching [gcode_macro <NAME>] shim to intercept it.
+LEGACY_SLICER_GCODE_COMMANDS = [
+    ("G29", "Marlin auto bed leveling -- Klipper has no built-in G29. Use BED_MESH_CALIBRATE / QUAD_GANTRY_LEVEL / Z_TILT_ADJUST instead, or define your own [gcode_macro G29] alias if your slicer always sends this."),
+    ("M420", "Marlin/RepRapFirmware bed-leveling-state command -- Klipper's bed_mesh module does not implement M420. Use BED_MESH_PROFILE LOAD=<name> / BED_MESH_CALIBRATE instead, or define a [gcode_macro M420] shim."),
+    ("M900", "Marlin linear-advance command -- Klipper does not support M900. Use SET_PRESSURE_ADVANCE ADVANCE=<value> instead, or define a [gcode_macro M900] shim."),
+    ("M572", "RepRapFirmware pressure-advance command -- Klipper does not support M572. Use SET_PRESSURE_ADVANCE ADVANCE=<value> instead."),
+    ("M203", "Marlin max-feedrate command -- Klipper already reads max_velocity from printer.cfg. Without a shim macro this is an unrecognized command, not a silent no-op -- SET_VELOCITY_LIMIT is the Klipper equivalent."),
+    ("M201", "Marlin max-acceleration command -- Klipper already reads max_accel from printer.cfg. Without a shim macro this is an unrecognized command, not a silent no-op -- SET_VELOCITY_LIMIT is the Klipper equivalent."),
+    ("M205", "Marlin jerk-settings command -- Klipper uses square_corner_velocity instead of jerk. Without a shim macro this is an unrecognized command -- SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=<value> is the Klipper equivalent."),
+    ("M907", "Marlin motor-current command -- Klipper does not support M907. Use SET_TMC_CURRENT STEPPER=<name> CURRENT=<amps> instead, or define a shim."),
+]
+
+# Reference-only notes on how the three most common slicers customarily
+# integrate with a Klipper PRINT_START/PRINT_END macro pair. This can't be
+# verified against the actual printer.cfg -- the slicer's own Start/End
+# G-code lives in the slicer profile itself, never in a .cfg file -- so
+# it is surfaced once as informational context rather than a pass/fail
+# check.
+SLICER_CONVENTION_NOTES = [
+    ("PrusaSlicer / SuperSlicer / OrcaSlicer (Klipper machine profile)",
+     "Custom Start G-code box typically calls a single macro with slicer placeholders as arguments, e.g. PRINT_START BED_TEMP=[first_layer_bed_temperature] EXTRUDER_TEMP=[first_layer_temperature] ...; the Custom End G-code box calls PRINT_END. Placeholders use square brackets."),
+    ("Cura",
+     "Native Start/End G-code is plain Marlin (no macro call) using curly-brace placeholders, e.g. M104 S{material_print_temperature_layer_0}. To use a Klipper PRINT_START macro instead, replace Cura's entire Start G-code box with a single call, e.g. PRINT_START BED_TEMP={material_bed_temperature_layer_0} EXTRUDER_TEMP={material_print_temperature_layer_0} ... (via the community 'Klipper Settings' Cura plugin, or by hand)."),
+    ("Bambu Studio / OrcaSlicer (Bambu machine profile)",
+     "Native machine Start/End G-code targets Bambu's own firmware commands (e.g. M1002, M973/M974), which Klipper does not implement. If flashing a non-Bambu printer with Klipper via a Bambu-derived slicer profile, switch to OrcaSlicer's generic Klipper machine profile (not the Bambu one) and replace the machine Start/End G-code with a PRINT_START/PRINT_END call."),
+]
+
+
+def uncommented(line: str) -> str:
+    return line.split("#", 1)[0].split(";", 1)[0].strip()
+
+
+def resolve_include(pattern: str, parent: Path) -> list[Path]:
+    pattern = os.path.expanduser(pattern.strip().strip("\"'"))
+    candidate = Path(pattern)
+    if not candidate.is_absolute():
+        candidate = parent.parent / candidate
+    return [Path(p).resolve() for p in sorted(glob.glob(str(candidate)))]
+
+
+def locations(items, config_dir: Path | None = None) -> str:
+    if config_dir is not None:
+        return ", ".join(f"{short_display_path(path, config_dir)} (line {line})" for _, path, line, *_ in items)
+    return ", ".join(f"{path} (line {line})" for _, path, line, *_ in items)
+
+
+def normalize_pin(pin_val: str) -> str:
+    cleaned = pin_val.split("#", 1)[0].split(";", 1)[0].strip()
+    return re.sub(r"^[!^~]+", "", cleaned).strip()
+
+
+class IncludeNode:
+    def __init__(self, path: Path, raw_pattern: str = ""):
+        self.path = path
+        self.raw_pattern = raw_pattern
+        self.children: list[IncludeNode] = []
+
+    def print_tree(self, prefix: str = "", is_last: bool = True):
+        connector = "└── " if is_last else "├── "
+        display = str(self.path.name) if not self.raw_pattern else f"{self.raw_pattern} ({self.path.name})"
+        print(f"{prefix}{connector}{display}")
+        new_prefix = prefix + ("    " if is_last else "│   ")
+        for i, child in enumerate(self.children):
+            child.print_tree(new_prefix, i == len(self.children) - 1)
+
+
+def scan(path: Path, sections, macros, renames, root_entries, visited_includes,
+         syntax_issues, section_options, pin_assignments, visited, missing,
+         node: IncludeNode | None = None, is_root=False, disabled_includes=None,
+         risky_calls=None):
+    path = path.resolve()
+    if path in visited:
+        return
+    if not path.is_file():
+        missing.append(path)
+        return
+    visited.add(path)
+    current = None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        missing.append(Path(f"{path} ({exc})"))
+        return
+
+    in_save_config_block = False
+
+    for number, raw in enumerate(lines, 1):
+        if raw.strip().startswith("#*# <---------------------- SAVE_CONFIG"):
+            in_save_config_block = True
+
+        # Syntax / hygiene checks on raw line
+        stripped_raw = raw.strip()
+
+        # 1. Check for malformed section brackets: e.g. `[stepper_x` without `]`
+        if stripped_raw.startswith("[") and not in_save_config_block and not stripped_raw.startswith("#"):
+            if "]" not in stripped_raw:
+                syntax_issues.append((path, number, f"Malformed section header (missing closing ']'): '{stripped_raw}'"))
+
+        # 1b. Track commented-out [include ...] lines: intentionally disabled,
+        # not the same thing as a truly unreferenced/orphaned file.
+        if disabled_includes is not None:
+            disabled = DISABLED_INCLUDE_RE.match(stripped_raw)
+            if disabled:
+                disabled_includes.append((disabled.group(1).strip(), path, number))
+
+        # 2. Check for unclosed quotes in simple option values (outside macro bodies / Jinja blocks)
+        if in_save_config_block:
+            save_match = SAVE_CONFIG_CONTENT_RE.match(raw)
+            line = save_match.group(1).rstrip() if save_match else ""
+        else:
+            line = uncommented(raw)
+        if not line:
+            continue
+
+        if not (current and current.lower().startswith(("gcode_macro", "delayed_gcode"))):
+            if ":" in line:
+                val = line.split(":", 1)[1].strip()
+                if val.count('"') % 2 != 0:
+                    syntax_issues.append((path, number, f"Unclosed double quote in option value: {val}"))
+                elif val.count("'") % 2 != 0 and not (val.startswith("'") and val.endswith("'")):
+                    if val.count("'") % 2 != 0:
+                        syntax_issues.append((path, number, f"Unclosed single quote in option value: {val}"))
+        elif risky_calls is not None:
+            # Inside a gcode_macro/delayed_gcode body: flag known
+            # bypass-safety-checks commands left in production macros.
+            for pattern, label, reason in RISKY_GCODE_COMMANDS:
+                if pattern.match(line):
+                    risky_calls.append((current, path, number, stripped_raw, label, reason))
+                    break
+
+
+        # 3. Check for broken Jinja delimiters (overall file count balance)
+        # Note: Valid Jinja blocks frequently span multiple lines, so we validate total file balance rather than single lines.
+
+        include = INCLUDE_RE.match(line)
+        if include:
+            inc_target = include.group(1).strip()
+            visited_includes.append((inc_target, path, number))
+            if is_root:
+                root_entries.append(("include", inc_target, path, number, in_save_config_block))
+            matches = resolve_include(inc_target, path)
+            if not matches:
+                missing.append(Path(f"{path}:{number} -> {inc_target}"))
+            for child in matches:
+                child_node = IncludeNode(child, inc_target)
+                if node is not None:
+                    node.children.append(child_node)
+                scan(child, sections, macros, renames, root_entries, visited_includes,
+                     syntax_issues, section_options, pin_assignments, visited, missing,
+                     child_node, is_root=False, disabled_includes=disabled_includes,
+                     risky_calls=risky_calls)
+            continue
+
+        section = SECTION_RE.match(line)
+        if section:
+            current = section.group(1).strip()
+            key = current.lower()
+            if is_root:
+                root_entries.append(("section", current, path, number, in_save_config_block))
+            sections[key].append((current, path, number, in_save_config_block))
+            macro = MACRO_RE.match(line)
+            if macro:
+                macros[macro.group(1).strip().lower()].append(
+                    (macro.group(1).strip(), path, number)
+                )
+            continue
+
+        # 4. Option parsing, duplicate/shadowed key check & pin assignment tracking
+        if in_save_config_block:
+            opt_match = SAVE_CONFIG_OPTION_RE.match(line)
+            opt_val = opt_match.group(2).strip() if opt_match else None
+        else:
+            opt_match = OPTION_RE.match(line)
+            opt_val = line.split(":", 1)[1].strip() if opt_match else None
+        if opt_match:
+            opt_name = opt_match.group(1).strip().lower()
+            if current:
+                sec_key = current.lower()
+                seen_opts = section_options[(path, current, in_save_config_block)]
+                if opt_name in seen_opts:
+                    prev_line = seen_opts[opt_name][0]
+                    syntax_issues.append(
+                        (path, number, f"Duplicate option '{opt_name}' in section [{current}] (previously defined at line {prev_line}). The later value will silently overwrite the earlier one.")
+                    )
+                seen_opts[opt_name] = (number, opt_val)
+
+                # Pin tracking (skip save_config overrides and virtual pins)
+                if not in_save_config_block and PIN_OPTION_RE.match(opt_name):
+                    norm_pin = normalize_pin(opt_val)
+                    if norm_pin and norm_pin.lower() not in VIRTUAL_PINS and not norm_pin.startswith("<"):
+                        pin_assignments[norm_pin].append((current, opt_name, path, number))
+            else:
+                syntax_issues.append((path, number, f"Orphaned option '{opt_name}' defined before any [section] header. Klipper will ignore this line."))
+
+        rename = RENAME_RE.match(line)
+        if rename and current and current.lower().startswith("gcode_macro "):
+            renames.append((current, rename.group(1), path, number))
+
+
+def check_ordering_and_hygiene(root_entries, sections, visited_includes, section_options, pin_assignments, config_dir: Path | None = None):
+    order_warnings = []
+    
+    # 1. Track root layout milestones
+    stepper_line = None
+    mcu_line = None
+    jwp_include_line = None
+    save_config_line = None
+
+    for kind, name, path, line_no, in_save in root_entries:
+        if in_save and save_config_line is None:
+            save_config_line = line_no
+        if kind == "section":
+            sec_lower = name.lower()
+            if sec_lower in ["stepper_x", "stepper_y", "stepper_z"] and stepper_line is None:
+                stepper_line = line_no
+            elif sec_lower == "mcu" and mcu_line is None:
+                mcu_line = line_no
+        elif kind == "include":
+            inc_lower = name.lower()
+            if "jwprobe" in inc_lower:
+                jwp_include_line = (name, line_no)
+            if ("nitehawk" in inc_lower or "toolboard" in inc_lower) and mcu_line is not None and line_no < mcu_line:
+                order_warnings.append(
+                    ("[WARN]", f"Toolboard include '{name}' at line {line_no} appears before [mcu] (line {mcu_line}). Verify main controller MCU loads first.")
+                )
+            if in_save:
+                order_warnings.append(
+                    ("[!] BOOT-BLOCKER", f"Include '[include {name}]' at line {line_no} is placed inside/after Klipper's auto-generated SAVE_CONFIG block. Move all [include ...] lines above the SAVE_CONFIG marker so they are not corrupted or clobbered.")
+                )
+
+    # 2. Check JWP include positioning in root printer.cfg
+    if jwp_include_line is not None:
+        jwp_name, jwp_line = jwp_include_line
+        if stepper_line is not None and jwp_line < stepper_line:
+            order_warnings.append(
+                ("[INFO]", f"JWP include '[include {jwp_name}]' at line {jwp_line} is placed BEFORE [stepper_x/y/z] definitions (line {stepper_line}). For clean organization, keep core steppers defined first.")
+            )
+
+    # 3. Check for manual edits vs SAVE_CONFIG duplicates / shadowing
+    for key, values in sections.items():
+        manual_defs = [v for v in values if not v[3]]
+        saved_defs = [v for v in values if v[3]]
+        if manual_defs and saved_defs:
+            order_warnings.append(
+                ("[WARN]", f"Section [{key}] is defined in config ({locations(manual_defs, config_dir)}) and also has saved values in Klipper's auto-generated SAVE_CONFIG block ({locations(saved_defs, config_dir)}). Check for stale overrides.")
+            )
+
+    # 4. Check for conflicting web client frontend includes (Mainsail vs Fluidd)
+    has_mainsail_inc = [inc for inc, p, l in visited_includes if "mainsail" in inc.lower()]
+    has_fluidd_inc = [inc for inc, p, l in visited_includes if "fluidd" in inc.lower()]
+    if has_mainsail_inc and has_fluidd_inc:
+        order_warnings.append(
+            ("[WARN]", f"Both Mainsail ('{has_mainsail_inc[0]}') and Fluidd ('{has_fluidd_inc[0]}') client files are included. Having both client configurations active simultaneously often causes duplicate PAUSE, RESUME, and CANCEL_PRINT macro collisions.")
+        )
+
+    # 5. Check for mutually exclusive bed leveling / gantry adjustment sections
+    # 5. Check for mutually exclusive leveling kinematics
+    if "quad_gantry_level" in sections and "z_tilt" in sections:
+        order_warnings.append(
+            ("[!] BOOT-BLOCKER", "Both [quad_gantry_level] and [z_tilt] sections are defined. Klipper does not permit both leveling kinematic models on the same machine; keep only the one matching your physical gantry/bed.")
+        )
+
+    # 6. Check for mutually exclusive homing overrides
+    if "safe_z_home" in sections and "homing_override" in sections:
+        order_warnings.append(
+            ("[!] BOOT-BLOCKER", "Both [safe_z_home] and [homing_override] sections are defined. Klipper will abort at startup with 'Section safe_z_home is not valid with homing_override'.")
+        )
+
+    # 7. Check common runtime helper dependencies
+    if "respond" not in sections:
+        order_warnings.append(
+            ("[WARN]", "Optional Klipper section [respond] is absent. If using custom macros that output status via RESPOND or action_respond_info, adding [respond] to printer.cfg enables full terminal response styling.")
+        )
+
+    # 8. Check kinematic sanity bounds on steppers (position_endstop vs position_min/position_max)
+    for axis in ["stepper_x", "stepper_y", "stepper_z"]:
+        if axis in sections:
+            opts = {}
+            for (p, sec_name, in_save), o_dict in section_options.items():
+                if sec_name.lower() == axis and not in_save:
+                    opts.update(o_dict)
+            if "position_max" in opts and "position_min" in opts:
+                try:
+                    p_min = float(opts["position_min"][1].split()[0])
+                    p_max = float(opts["position_max"][1].split()[0])
+                    if p_min >= p_max:
+                        order_warnings.append(
+                            ("[!] BOOT-BLOCKER", f"Kinematic error in [{axis}]: position_min ({p_min}) is greater than or equal to position_max ({p_max}).")
+                        )
+                    if "position_endstop" in opts:
+                        p_end = float(opts["position_endstop"][1].split()[0])
+                        if p_end < p_min or p_end > p_max:
+                            order_warnings.append(
+                                ("[!] RUNTIME-ERROR", f"Kinematic error in [{axis}]: position_endstop ({p_end}) is outside the travel range [{p_min}, {p_max}]. Homing this axis will raise a Klipper error.")
+                            )
+                except ValueError:
+                    pass
+
+    # 9. Check heater & thermistor sanity ([extruder], [heater_bed], [heater_generic ...])
+    for (p, sec_name, in_save), o_dict in section_options.items():
+        sec_l = sec_name.lower()
+        if not in_save and (sec_l in {"extruder", "heater_bed"} or sec_l.startswith("heater_generic")):
+            if "min_temp" in o_dict and "max_temp" in o_dict:
+                try:
+                    t_min = float(o_dict["min_temp"][1].split()[0])
+                    t_max = float(o_dict["max_temp"][1].split()[0])
+                    if t_min >= t_max:
+                        order_warnings.append(
+                            ("[!] BOOT-BLOCKER", f"Temperature safety error in [{sec_name}] ({p}:{o_dict['min_temp'][0]}): min_temp ({t_min}) >= max_temp ({t_max}).")
+                        )
+                    if t_min < -100 or t_max > 550:
+                        order_warnings.append(
+                            ("[WARN]", f"Unusual temperature range in [{sec_name}]: [{t_min}°C to {t_max}°C]. Verify safety limits.")
+                        )
+                except ValueError:
+                    pass
+            if "sensor_type" not in o_dict:
+                order_warnings.append(
+                    ("[!] BOOT-BLOCKER", f"Heater section [{sec_name}] in {p} is missing 'sensor_type' definition.")
+                )
+
+    # 10. Check Pin Assignment Collisions
+    for pin, uses in pin_assignments.items():
+        sec_uses = defaultdict(list)
+        for sec_name, opt_name, p, line_no in uses:
+            sec_uses[sec_name.lower()].append((sec_name, opt_name, p, line_no))
+
+        if len(sec_uses) > 1:
+            sec_names = list(sec_uses.keys())
+            is_benign = False
+            if len(sec_names) == 2:
+                s1, s2 = sec_names[0], sec_names[1]
+                if ("tmc" in s1 and s2 in s1) or ("tmc" in s2 and s1 in s2):
+                    is_benign = True
+
+            if not is_benign:
+                use_details = ", ".join(f"[{s_name}] ({opt}) at {p.name}:{ln}"
+                                        for s, items in sec_uses.items()
+                                        for s_name, opt, p, ln in items)
+                order_warnings.append(
+                    ("[!] BOOT-BLOCKER", f"MCU Pin Collision: Pin '{pin}' is assigned to multiple components: {use_details}.")
+                )
+
+    # 11. Check Probe Offsets vs Bed Mesh & QGL Bounds
+    probe_opts = {}
+    for (p, sec_name, in_save), o_dict in section_options.items():
+        if sec_name.lower() == "probe" and not in_save:
+            probe_opts.update(o_dict)
+
+    x_offset = 0.0
+    y_offset = 0.0
+    if "x_offset" in probe_opts:
+        try: x_offset = float(probe_opts["x_offset"][1].split()[0])
+        except ValueError: pass
+    if "y_offset" in probe_opts:
+        try: y_offset = float(probe_opts["y_offset"][1].split()[0])
+        except ValueError: pass
+
+    # Get stepper limits
+    x_min, x_max = 0.0, 0.0
+    y_min, y_max = 0.0, 0.0
+    for (p, sec_name, in_save), o_dict in section_options.items():
+        if not in_save:
+            if sec_name.lower() == "stepper_x":
+                if "position_min" in o_dict:
+                    try: x_min = float(o_dict["position_min"][1].split()[0])
+                    except ValueError: pass
+                if "position_max" in o_dict:
+                    try: x_max = float(o_dict["position_max"][1].split()[0])
+                    except ValueError: pass
+            elif sec_name.lower() == "stepper_y":
+                if "position_min" in o_dict:
+                    try: y_min = float(o_dict["position_min"][1].split()[0])
+                    except ValueError: pass
+                if "position_max" in o_dict:
+                    try: y_max = float(o_dict["position_max"][1].split()[0])
+                    except ValueError: pass
+
+    # Validate bed_mesh min/max
+    for (p, sec_name, in_save), o_dict in section_options.items():
+        if sec_name.lower() == "bed_mesh" and not in_save:
+            if "mesh_min" in o_dict:
+                try:
+                    parts = [float(x.strip()) for x in o_dict["mesh_min"][1].split(",")]
+                    if len(parts) == 2:
+                        m_x, m_y = parts
+                        nozzle_x = m_x - x_offset
+                        nozzle_y = m_y - y_offset
+                        if nozzle_x < x_min or nozzle_x > x_max:
+                            order_warnings.append(
+                                ("[!] RUNTIME-ERROR", f"Probe Travel Conflict: [bed_mesh] mesh_min X={m_x} with probe x_offset={x_offset} requires nozzle move to X={nozzle_x:.1f}, which is outside [stepper_x] range [{x_min}, {x_max}].")
+                            )
+                        if nozzle_y < y_min or nozzle_y > y_max:
+                            order_warnings.append(
+                                ("[!] RUNTIME-ERROR", f"Probe Travel Conflict: [bed_mesh] mesh_min Y={m_y} with probe y_offset={y_offset} requires nozzle move to Y={nozzle_y:.1f}, which is outside [stepper_y] range [{y_min}, {y_max}]. (Move out of range error! Increase mesh_min Y to at least {y_min + y_offset + 2.0:.0f}).")
+                            )
+                except ValueError: pass
+
+            if "mesh_max" in o_dict:
+                try:
+                    parts = [float(x.strip()) for x in o_dict["mesh_max"][1].split(",")]
+                    if len(parts) == 2:
+                        m_x, m_y = parts
+                        nozzle_x = m_x - x_offset
+                        nozzle_y = m_y - y_offset
+                        if nozzle_x < x_min or nozzle_x > x_max:
+                            order_warnings.append(
+                                ("[!] RUNTIME-ERROR", f"Probe Travel Conflict: [bed_mesh] mesh_max X={m_x} with probe x_offset={x_offset} requires nozzle move to X={nozzle_x:.1f}, which is outside [stepper_x] range [{x_min}, {x_max}].")
+                            )
+                        if nozzle_y < y_min or nozzle_y > y_max:
+                            order_warnings.append(
+                                ("[!] RUNTIME-ERROR", f"Probe Travel Conflict: [bed_mesh] mesh_max Y={m_y} with probe y_offset={y_offset} requires nozzle move to Y={nozzle_y:.1f}, which is outside [stepper_y] range [{y_min}, {y_max}].")
+                            )
+                except ValueError: pass
+
+    return order_warnings
+
+
+def _first_token_float(raw_val: str):
+    """Best-effort float parse of an option value, ignoring a trailing inline comment."""
+    try:
+        return float(raw_val.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def check_hardware_calibration_sanity(sections, section_options):
+    """Hardware/calibration sanity checks kept deliberately separate from
+    check_ordering_and_hygiene(): that function is about include ordering,
+    structural, pin & kinematic bounds; this one is about values that are
+    syntactically fine but numerically suspicious or left over from a
+    calibration/bring-up step (TMC current, PID tuning staleness, an
+    autotune plugin silently overriding manual current settings, and
+    orphaned SAVE_CONFIG entries)."""
+    warnings_out = []
+
+    manual_defs_by_key = defaultdict(list)  # sec_key -> list of (path, sec_name, opts)
+    for (p, sec_name, in_save), o_dict in section_options.items():
+        if not in_save:
+            manual_defs_by_key[sec_name.lower()].append((p, sec_name, o_dict))
+
+    # 1. TMC driver current sanity: run_current/hold_current out of a
+    #    plausible Amps range (a common mistake is pasting a datasheet mA
+    #    value straight in), and hold_current set higher than run_current.
+    for sec_key, defs in manual_defs_by_key.items():
+        if not sec_key.startswith("tmc"):
+            continue
+        for p, sec_name, opts in defs:
+            run_current = _first_token_float(opts["run_current"][1]) if "run_current" in opts else None
+            hold_current = _first_token_float(opts["hold_current"][1]) if "hold_current" in opts else None
+            if run_current is not None:
+                if run_current <= 0 or run_current > TMC_MAX_REASONABLE_CURRENT:
+                    warnings_out.append(
+                        ("[WARN]", f"[{sec_name}] ({p.name}:{opts['run_current'][0]}) run_current={run_current} looks out of range for Amps -- Klipper expects Amps, not milliamps (e.g. 1.2, not 1200). Double-check against your driver/motor datasheet.")
+                    )
+            if run_current is not None and hold_current is not None and hold_current > run_current:
+                warnings_out.append(
+                    ("[WARN]", f"[{sec_name}] ({p.name}:{opts['hold_current'][0]}) hold_current ({hold_current}) is higher than run_current ({run_current}). hold_current is normally lower than or equal to run_current so idle steppers run cooler; verify this is intentional.")
+                )
+
+    # 2. Autotune_tmc plugin silently overriding a manually-set run_current.
+    #    Example: [autotune_tmc stepper_x] present alongside
+    #    [tmc5160 stepper_x] run_current: 1.2 -- autotune_tmc manages
+    #    current dynamically at runtime, so manual run_current edits can
+    #    appear to have no effect.
+    autotune_steppers = {}
+    for sec_key, defs in manual_defs_by_key.items():
+        if sec_key.startswith("autotune_tmc "):
+            stepper_name = sec_key.split(None, 1)[1]
+            autotune_steppers[stepper_name] = defs[0][0]  # first defining path
+
+    for sec_key, defs in manual_defs_by_key.items():
+        if not sec_key.startswith("tmc"):
+            continue
+        parts = sec_key.split(None, 1)
+        if len(parts) != 2:
+            continue
+        stepper_name = parts[1]
+        if stepper_name in autotune_steppers:
+            for p, sec_name, opts in defs:
+                if "run_current" in opts:
+                    warnings_out.append(
+                        ("[WARN]", f"[autotune_tmc {stepper_name}] ({autotune_steppers[stepper_name].name}) is active for this stepper, but [{sec_name}] ({p.name}:{opts['run_current'][0]}) still sets run_current manually. autotune_tmc recalculates and overrides current settings at runtime, so changes to run_current here may appear to have no effect -- tune via autotune_tmc's own settings instead, or remove the autotune_tmc section if you want manual control.")
+                    )
+
+    # 3. PID tuning staleness: control: pid set but never actually tuned.
+    #    Covers heaters (extruder/heater_bed/heater_generic) and PID-driven
+    #    fans (temperature_fan), both of which support control: pid.
+    for sec_key, defs in manual_defs_by_key.items():
+        is_heater = sec_key in {"extruder", "heater_bed"} or sec_key.startswith("heater_generic")
+        is_pid_fan = sec_key.startswith("temperature_fan ")
+        if not (is_heater or is_pid_fan):
+            continue
+        for p, sec_name, opts in defs:
+            if "control" not in opts:
+                continue
+            control_val = opts["control"][1].split()[0].strip().lower() if opts["control"][1].split() else ""
+            if control_val != "pid":
+                continue
+            calibrate_hint = (
+                f"Run PID_CALIBRATE HEATER={sec_name} TARGET=<your usual temp> and SAVE_CONFIG."
+                if is_heater
+                else "temperature_fan has no PID_CALIBRATE command -- these values must be tuned by hand (raise/lower Kp/Ki/Kd and observe fan response)."
+            )
+            if "pid_kp" not in opts or "pid_ki" not in opts or "pid_kd" not in opts:
+                warnings_out.append(
+                    ("[INFO]", f"[{sec_name}] ({p.name}:{opts['control'][0]}) sets control: pid but has no pid_Kp/Ki/Kd values -- it has probably never been tuned and will fall back to Klipper's untuned defaults until then. {calibrate_hint}")
+                )
+                continue
+            kp = _first_token_float(opts["pid_kp"][1])
+            ki = _first_token_float(opts["pid_ki"][1])
+            kd = _first_token_float(opts["pid_kd"][1])
+            if (kp, ki, kd) == (PID_PLACEHOLDER_VALUES["pid_kp"], PID_PLACEHOLDER_VALUES["pid_ki"], PID_PLACEHOLDER_VALUES["pid_kd"]):
+                warnings_out.append(
+                    ("[WARN]", f"[{sec_name}] ({p.name}:{opts['pid_kp'][0]}) pid_Kp/Ki/Kd are still {kp}/{ki}/{kd} -- these are Klipper's example-config placeholder values, not tuned ones. {calibrate_hint}")
+                )
+
+    # 4. Orphaned SAVE_CONFIG-only sections: values Klipper saved for a
+    #    section that no longer has any matching manual [section] at all
+    #    (commonly left behind after removing/renaming hardware).
+    for sec_key, values in sections.items():
+        if sec_key in SAVE_CONFIG_ONLY_WHITELIST or sec_key.startswith("bed_mesh "):
+            continue
+        has_manual = any(not v[3] for v in values)
+        has_saved = any(v[3] for v in values)
+        if has_saved and not has_manual:
+            first_name, first_path, first_line, _ = values[0]
+            warnings_out.append(
+                ("[INFO]", f"Orphaned SAVE_CONFIG entry [{first_name}] ({first_path.name}:{first_line}) has saved values but no matching manual [{first_name}] section anywhere in your config -- likely leftover from hardware that was removed/renamed. Safe to delete that block from below the '# DO NOT EDIT' marker if it's no longer used.")
+            )
+
+    return warnings_out
+
+
+def extract_macro_body(path: Path, header_line: int) -> list[tuple[int, str]]:
+    """Return (line_no, raw_line) pairs making up a gcode_macro body: every
+    line after its `[gcode_macro NAME]` header (header_line, 1-based, as
+    already recorded in `macros`/`sections`) up to but excluding the next
+    top-level `[section]` header."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    body = []
+    for idx in range(header_line, len(lines)):
+        raw = lines[idx]
+        if raw.startswith("["):
+            break
+        body.append((idx + 1, raw))
+    return body
+
+
+def check_print_lifecycle_macros(macros, config_dir: Path | None = None, idle_timeout_seconds: float | None = None):
+    """Print/pause/cancel/resume lifecycle hygiene, checked directly
+    against the macro bodies (not option key/value pairs like the other
+    checks): missing end-of-job shutdown steps (heaters/fans left
+    energized), an immediate motor-disable in PRINT_END/CANCEL_PRINT that
+    would break JWP's quick-reprint/rescan workflow, a PAUSE/M600 that
+    accidentally disables steppers and loses toolhead position, calls to
+    optional plugin/hardware commands left unguarded, leftover slicer
+    placeholder syntax pasted into the wrong place, back-to-back duplicate
+    lines, and inconsistent PRINT_START parameter naming across multiple
+    definitions of the same macro."""
+    warnings_out = []
+
+    def loc(path):
+        return short_display_path(path, config_dir) if config_dir else path.name
+
+    def has_pattern(body, *patterns):
+        return any(any(p.search(uncommented(raw)) for p in patterns) for _, raw in body)
+
+    lifecycle_names = PRINT_START_MACRO_NAMES | PRINT_TERMINAL_MACRO_NAMES | PRINT_PAUSE_MACRO_NAMES | {"resume"}
+
+    # 1. Slicer-placeholder leakage, unguarded optional-hardware calls, and
+    #    redundant back-to-back duplicate lines -- checked across every
+    #    macro in the print/pause/cancel/resume lifecycle family.
+    for macro_key in lifecycle_names:
+        for name, path, header_line in macros.get(macro_key, []):
+            body = extract_macro_body(path, header_line)
+
+            for ln, raw in body:
+                for pattern, slicer_name in SLICER_PLACEHOLDER_PATTERNS:
+                    m = pattern.search(raw)
+                    if m:
+                        warnings_out.append(
+                            ("[WARN]", f"[{name}] ({loc(path)}:{ln}) contains '{m.group(0)}', which looks like a {slicer_name} slicer placeholder token -- these are only substituted inside the slicer's own Start/End G-code text box, never inside a Klipper .cfg file. Remove it, or replace it with a params.<NAME>|default(...) value actually passed in from your slicer's custom g-code.")
+                        )
+
+            if_depth = 0
+            for ln, raw in body:
+                stripped = raw.strip()
+                if_depth += len(re.findall(r"\{%-?\s*if\b", stripped))
+                if_depth -= len(re.findall(r"\{%-?\s*endif\s*-?%\}", stripped))
+                if if_depth > 0:
+                    continue
+                line = uncommented(raw)
+                if not line:
+                    continue
+                for pattern, label, guard_hint in OPTIONAL_HARDWARE_CALLS:
+                    if pattern.match(line):
+                        warnings_out.append(
+                            ("[WARN]", f"[{name}] ({loc(path)}:{ln}) calls {label} with no surrounding {{% if %}} guard -- this raises 'Unknown command' the moment this macro runs on a printer that doesn't have that module/macro configured. Wrap it, e.g. {{% if {guard_hint} %}} {line.strip()} {{% endif %}}.")
+                        )
+                        break
+
+            prev = None
+            for ln, raw in body:
+                line = uncommented(raw).strip()
+                if not line:
+                    continue
+                if prev is not None and line == prev[1]:
+                    warnings_out.append(
+                        ("[INFO]", f"[{name}] ({loc(path)}:{ln}) repeats the identical command from line {prev[0]} with nothing in between -- likely a leftover duplicate; safe to remove one copy: '{line}'")
+                    )
+                prev = (ln, line)
+
+    # 2. Missing end-of-job shutdown steps for macros that truly terminate
+    #    a job: PRINT_END/END_PRINT/CANCEL_PRINT should release heaters and
+    #    fans. Stepper motors are handled separately below (check 2b) --
+    #    for a probe-equipped machine like JWP an immediate M84/M18 here is
+    #    actually undesirable, not merely optional.
+    heater_off_re = re.compile(r"^\s*(TURN_OFF_HEATERS\b|M104\s+S0\b|M140\s+S0\b|M109\s+S0\b|M190\s+S0\b)", re.I)
+    fan_off_re = re.compile(r"^\s*(M107\b|M106\s+S0\b)", re.I)
+    motor_off_re = re.compile(r"^\s*(M84\b|M18\b)", re.I)
+
+    for macro_key in PRINT_TERMINAL_MACRO_NAMES:
+        for name, path, header_line in macros.get(macro_key, []):
+            body = extract_macro_body(path, header_line)
+            if not has_pattern(body, heater_off_re):
+                warnings_out.append(
+                    ("[WARN]", f"[{name}] ({loc(path)}:{header_line}) never calls TURN_OFF_HEATERS (or M104/M140 S0) -- the hotend and bed stay at their last target temperature after the job ends/is cancelled, wasting power and heat-soaking unattended.")
+                )
+            if not has_pattern(body, fan_off_re):
+                warnings_out.append(
+                    ("[INFO]", f"[{name}] ({loc(path)}:{header_line}) never turns off the parts-cooling fan (M107 / M106 S0) -- it keeps spinning after the job ends.")
+                )
+
+    # 2b. Immediate M84/M18 in PRINT_END/CANCEL_PRINT: on a probe-equipped
+    #     machine like JWP, disabling steppers immediately forces Klipper
+    #     to consider the axes unhomed again, which throws away dock
+    #     alignment confidence and forces a full re-home before the next
+    #     quick reprint/rescan. Recommend relying on Klipper's own
+    #     [idle_timeout] fallback instead of an immediate M84/M18.
+    for macro_key in PRINT_TERMINAL_MACRO_NAMES:
+        for name, path, header_line in macros.get(macro_key, []):
+            body = extract_macro_body(path, header_line)
+            for ln, raw in body:
+                if motor_off_re.match(uncommented(raw)):
+                    warnings_out.append(
+                        ("[INFO]", f"[{name}] ({loc(path)}:{ln}) disables the stepper motors (M84/M18) immediately at the end of the job -- on a probe-equipped machine this forces Klipper to treat the axes as unhomed, so the next quick reprint/rescan has to fully re-home instead of trusting the existing dock alignment. Consider removing this line and letting Klipper's own [idle_timeout] release the motors after a real idle period instead.")
+                    )
+
+    idle_timeout_recommend_s = 1800  # 30 minutes: long enough to survive
+                                      # normal quick-reprint/rescan turnaround,
+                                      # short enough not to hold power/heat all day.
+    if idle_timeout_seconds is None:
+        warnings_out.append(
+            ("[INFO]", f"No explicit [idle_timeout] section found -- Klipper's built-in default of 600s (10 minutes) applies. For JWP's quick-reprint/rescan workflow that's often too short (steppers release, forcing a re-home, before you've had a chance to reload/reposition). Consider adding an explicit [idle_timeout] with timeout: {idle_timeout_recommend_s} (~30 minutes) as a starting point, tuned to your own turnaround time.")
+        )
+    elif idle_timeout_seconds < 900:
+        warnings_out.append(
+            ("[WARN]", f"[idle_timeout] timeout is {int(idle_timeout_seconds)}s ({idle_timeout_seconds/60:.0f} min) -- fairly short for JWP's quick-reprint/rescan workflow; steppers may release (forcing a re-home) before you've finished reloading/repositioning between jobs. Consider raising it toward {idle_timeout_recommend_s}s (~30 minutes).")
+        )
+    elif idle_timeout_seconds > 3600:
+        warnings_out.append(
+            ("[WARN]", f"[idle_timeout] timeout is {int(idle_timeout_seconds)}s ({idle_timeout_seconds/60:.0f} min) -- fairly long; steppers (and any heaters your macros left on) stay energized/hot for that whole time after a job finishes with nobody around, drawing power and generating unnecessary heat. Consider lowering it toward {idle_timeout_recommend_s}s (~30 minutes) unless you have a specific reason for the longer window.")
+        )
+
+    # 3. PAUSE/M600 must NOT disable steppers -- that loses the toolhead's
+    #    tracked position, so RESUME can no longer safely continue.
+    for macro_key in PRINT_PAUSE_MACRO_NAMES:
+        for name, path, header_line in macros.get(macro_key, []):
+            body = extract_macro_body(path, header_line)
+            for ln, raw in body:
+                if motor_off_re.match(uncommented(raw)):
+                    warnings_out.append(
+                        ("[WARN]", f"[{name}] ({loc(path)}:{ln}) disables the stepper motors (M84/M18) during a pause -- this loses the toolhead's tracked position, so RESUME can't safely continue the print. Only disable motors in PRINT_END/CANCEL_PRINT, never in PAUSE/M600.")
+                    )
+
+    # 4. Chamber/case light left on: if any PRINT_START-family macro turns
+    #    it on, something in the terminal/pause family should turn it back
+    #    off, or it stays lit indefinitely after the job finishes.
+    light_on_re = re.compile(r"^\s*set_case_light_on\b", re.I)
+    light_off_re = re.compile(r"^\s*set_case_light_off\b", re.I)
+    first_on_loc = None
+    any_light_off = False
+    for macro_key in PRINT_START_MACRO_NAMES:
+        for name, path, header_line in macros.get(macro_key, []):
+            body = extract_macro_body(path, header_line)
+            if first_on_loc is None and has_pattern(body, light_on_re):
+                first_on_loc = (name, path, header_line)
+    for macro_key in PRINT_TERMINAL_MACRO_NAMES | PRINT_PAUSE_MACRO_NAMES:
+        for name, path, header_line in macros.get(macro_key, []):
+            body = extract_macro_body(path, header_line)
+            if has_pattern(body, light_off_re):
+                any_light_off = True
+    if first_on_loc and not any_light_off:
+        name, path, header_line = first_on_loc
+        warnings_out.append(
+            ("[INFO]", f"[{name}] ({loc(path)}:{header_line}) turns the chamber/case light on (set_case_light_on) at print start, but no PRINT_END/CANCEL_PRINT/PAUSE macro anywhere calls set_case_light_off -- the light stays on indefinitely after the job finishes. Consider adding set_case_light_off to your end-of-job macro(s).")
+        )
+
+    # 5. Cross-file PRINT_START/START_PRINT parameter-name consistency: if
+    #    two definitions expect different slicer parameter names, whichever
+    #    one is actually active may silently fall back to its own default
+    #    temperature if the slicer's real Start G-code doesn't match it.
+    param_re = re.compile(r"params\.([A-Z_][A-Z0-9_]*)")
+    start_param_sets = defaultdict(list)
+    for macro_key in PRINT_START_MACRO_NAMES:
+        for name, path, header_line in macros.get(macro_key, []):
+            body = extract_macro_body(path, header_line)
+            params_found = set()
+            for _, raw in body:
+                params_found.update(param_re.findall(raw))
+            temp_params = frozenset(p for p in params_found if "TEMP" in p or p in {"BED", "EXTRUDER"})
+            if temp_params:
+                start_param_sets[temp_params].append((name, path, header_line))
+    if len(start_param_sets) > 1:
+        examples = []
+        for pset, defs in start_param_sets.items():
+            ex_name, ex_path, ex_line = defs[0]
+            examples.append(f"{{{', '.join(sorted(pset))}}} e.g. [{ex_name}] ({loc(ex_path)}:{ex_line})")
+        warnings_out.append(
+            ("[WARN]", "Multiple PRINT_START/START_PRINT definitions expect different slicer parameter names: " + " vs. ".join(examples) + " -- whichever definition actually loads (see the duplicate-macro section above) silently falls back to its own default temperature if your slicer's real Start G-code call uses the other naming scheme. Standardize on one naming scheme across your slicer profile and macro.")
+        )
+
+    return warnings_out
+
+
+def check_slicer_start_end_compat(macros, config_dir: Path | None = None):
+    """Print Start/End G-code: slicer compatibility & deprecated-command
+    hygiene. Scans PRINT_START/START_PRINT/PRINT_END/END_PRINT/
+    CANCEL_PRINT macro bodies for legacy Marlin/RepRapFirmware commands
+    Klipper doesn't implement natively (G29, M420, M900, M572, M203,
+    M201, M205, M907). A hit with no matching [gcode_macro <NAME>] shim
+    defined anywhere in the config is flagged as a RUNTIME-ERROR, since
+    Klipper raises 'Unknown command' the instant that line executes; a
+    hit that IS shimmed is downgraded to an informational note (verify
+    it does what you expect). Also emits a one-time informational
+    reference note on how the top three slicers customarily integrate
+    with a Klipper PRINT_START/PRINT_END macro pair -- this can't be
+    checked against the .cfg itself, since the slicer's own Start/End
+    G-code lives in the slicer profile, never in a config file.
+    """
+    warnings_out = []
+
+    def loc(path):
+        return short_display_path(path, config_dir) if config_dir else path.name
+
+    lifecycle_names = PRINT_START_MACRO_NAMES | PRINT_TERMINAL_MACRO_NAMES
+    seen_hits = set()
+
+    for macro_key in lifecycle_names:
+        for name, path, header_line in macros.get(macro_key, []):
+            body = extract_macro_body(path, header_line)
+            for ln, raw in body:
+                line = uncommented(raw)
+                if not line:
+                    continue
+                for cmd, reason in LEGACY_SLICER_GCODE_COMMANDS:
+                    if re.match(rf"^{cmd}\b", line, re.I):
+                        shim_defined = cmd.lower() in macros
+                        if shim_defined:
+                            tag = "[INFO]"
+                            note = f"a [gcode_macro {cmd}] shim is defined elsewhere in this config, so this may already be handled -- verify it does what you expect."
+                        else:
+                            tag = "[!] RUNTIME-ERROR"
+                            note = f"no [gcode_macro {cmd}] shim is defined anywhere in this config, so Klipper will raise 'Unknown command: {cmd}' the instant this line runs."
+                        warnings_out.append(
+                            (tag, f"[{name}] ({loc(path)}:{ln}) calls legacy command {cmd} -- {reason} ({note})")
+                        )
+                        seen_hits.add(cmd)
+                        break
+
+    if seen_hits:
+        for slicer, note in SLICER_CONVENTION_NOTES:
+            warnings_out.append(("[INFO]", f"{slicer}: {note}"))
+
+    return warnings_out
+
+
+def short_display_path(path: Path, config_dir: Path) -> str:
+    """Shorten a path for display: keep only the config dir's own name as the
+    root instead of its full absolute prefix (e.g. a printer host path like
+    /home/tlam/printer_data/config/jabberwockyprobe/foo.cfg displays as
+    config/jabberwockyprobe/foo.cfg) -- the long, redundant home/user prefix
+    adds no information once every path shares it.
+    """
+    try:
+        rel = path.resolve().relative_to(config_dir.resolve())
+        return str(Path(config_dir.name) / rel)
+    except ValueError:
+        return str(path)
+
+
+GCODE_EXTENSIONS = {".gcode", ".g", ".gco", ".ufp"}
+
+
+def human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+        size /= 1024
+    return f"{size:.1f}TB"
+
+
+def gcode_folder_stats(gcodes_dir: Path, top_n: int = 5):
+    """Walk Moonraker's gcodes folder (siblings printer_data/gcodes by
+    convention) and report file count, total size, and the largest files --
+    useful for spotting a full SD card / disk before it halts prints.
+    """
+    if not gcodes_dir.is_dir():
+        return None
+    files = []
+    total_size = 0
+    for entry in gcodes_dir.rglob("*"):
+        if entry.is_file() and entry.suffix.lower() in GCODE_EXTENSIONS:
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                continue
+            files.append((entry, size))
+            total_size += size
+    largest = sorted(files, key=lambda item: item[1], reverse=True)[:top_n]
+    disk_total = disk_free = None
+    try:
+        usage = shutil.disk_usage(gcodes_dir)
+        disk_total, disk_free = usage.total, usage.free
+    except OSError:
+        pass
+    return {
+        "count": len(files),
+        "total_size": total_size,
+        "largest": largest,
+        "disk_total": disk_total,
+        "disk_free": disk_free,
+    }
+
+
+def log_folder_stats(logs_dir: Path, top_n: int = 5):
+    """Walk Moonraker's logs folder (printer_data/logs sibling) and report
+    total size plus a breakdown of rotated log backups (klippy.log.1, .2,
+    ...) and crash-dump archives (*.zip from Moonraker's crash reporter) --
+    both accumulate quietly over time and can fill a disk unnoticed.
+    """
+    if not logs_dir.is_dir():
+        return None
+    all_files = []
+    rotated_files = []
+    crash_dumps = []
+    total_size = 0
+    for entry in logs_dir.rglob("*"):
+        if not entry.is_file():
+            continue
+        try:
+            size = entry.stat().st_size
+        except OSError:
+            continue
+        all_files.append((entry, size))
+        total_size += size
+        name = entry.name.lower()
+        if re.search(r"\.log\.\d+(\.gz)?$", name):
+            rotated_files.append((entry, size))
+        elif name.endswith(".zip"):
+            crash_dumps.append((entry, size))
+    largest = sorted(all_files, key=lambda item: item[1], reverse=True)[:top_n]
+    return {
+        "count": len(all_files),
+        "total_size": total_size,
+        "largest": largest,
+        "rotated_count": len(rotated_files),
+        "rotated_size": sum(size for _, size in rotated_files),
+        "crash_dump_count": len(crash_dumps),
+        "crash_dump_size": sum(size for _, size in crash_dumps),
+    }
+
+
+def find_orphaned_configs(root_config: Path, visited: set[Path], disabled_includes=None):
+    """Return (orphans, disabled_paths, dangling, filtered, hidden):
+    orphans is every live, non-hidden, non-archival .cfg file under
+    config_dir that no active (uncommented) [include ...] reaches;
+    disabled_paths is the subset of those whose only reference in the
+    tree is a commented-out [include ...] line -- i.e. intentionally
+    turned off, not truly abandoned; dangling is the list of commented-out
+    [include ...] directives whose target file(s) no longer exist on disk
+    at all (a stale reference left behind after deleting the file);
+    filtered is unreferenced files that look like archival/backup copies
+    (is_backup_config()) and were previously silently excluded with no
+    visibility at all; hidden is unreferenced dotfiles (name starts with
+    '.'), typically editor swap/backup artifacts rather than real config.
+    """
+    config_dir = root_config.resolve().parent
+    disabled_paths: set[Path] = set()
+    dangling = []
+    if disabled_includes:
+        for inc_target, parent, line in disabled_includes:
+            matches = resolve_include(inc_target, parent)
+            if not matches:
+                dangling.append((inc_target, parent, line))
+            for match in matches:
+                disabled_paths.add(match)
+    orphans = []
+    filtered = []
+    hidden = []
+    for cfg_file in config_dir.glob("**/*.cfg"):
+        if not cfg_file.is_file() or cfg_file.resolve() in visited:
+            continue
+        if cfg_file.name.startswith("."):
+            hidden.append(cfg_file)
+        elif is_backup_config(cfg_file):
+            filtered.append(cfg_file)
+        else:
+            orphans.append(cfg_file)
+    return sorted(orphans), disabled_paths, dangling, sorted(filtered), sorted(hidden)
+
+
+def quarantine_files(files: list[Path], config_dir: Path, dest_root: Path):
+    """Move each file into dest_root, preserving its subdirectory layout
+    relative to config_dir (so e.g. config/old/foo.cfg becomes
+    config/<dest_root.name>/old/foo.cfg). Returns (moved, errors) where
+    moved is a list of (src, dst) pairs and errors is a list of
+    (src, exception). Never overwrites an existing destination file --
+    appends a numeric suffix instead, since dest_root itself lives inside
+    config_dir and could already contain a same-named leftover from a
+    prior run.
+    """
+    moved = []
+    errors = []
+    for src in files:
+        try:
+            rel = src.resolve().relative_to(config_dir.resolve())
+        except ValueError:
+            errors.append((src, "not inside config_dir"))
+            continue
+        dest = dest_root / rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                stem, suffix = dest.stem, dest.suffix
+                counter = 1
+                candidate = dest
+                while candidate.exists():
+                    candidate = dest.with_name(f"{stem}_{counter}{suffix}")
+                    counter += 1
+                dest = candidate
+            shutil.move(str(src), str(dest))
+            moved.append((src, dest))
+        except OSError as exc:
+            errors.append((src, exc))
+    return moved, errors
+
+
+def collapse_repetitive_files(paths: list[Path], min_group_size: int = 3):
+    """Group files that only differ by a trailing date/serial number --
+    e.g. Moonraker/Mainsail's own printer-YYYYMMDD_HHMMSS.cfg auto-backups
+    created on every config save, or jwprobe_test_macros_bak/_bak2/_bak3
+    -- so a report doesn't spend dozens of lines listing what is really
+    the same rotating backup over and over. Any run of `min_group_size`
+    or more files sharing a parent directory, suffix, and a trailing-
+    digit-stripped stem is folded into one group; anything below that
+    threshold is left listed individually, unchanged. Returns a list
+    whose items are either a bare Path (no collapsing applied) or a
+    (collapsed_stem, suffix, members) tuple, where members is the full
+    sorted list of paths in that group (so quarantine/move logic can
+    still act on every real file -- only the on-screen listing is
+    compacted).
+    """
+    groups = defaultdict(list)
+    order = []
+    for p in paths:
+        # Strip any trailing run of digits (each optionally preceded by a
+        # '-'/'_' separator) from the stem -- this normalizes both
+        # Moonraker/Mainsail timestamp suffixes (printer-20240803_144219
+        # -> printer) and simple numbered backup suffixes
+        # (jwprobe_test_macros_bak2/_bak3 -> jwprobe_test_macros_bak) to
+        # the same collapse key, without touching digits that appear
+        # elsewhere in the middle of a filename.
+        key = (p.parent, re.sub(r"(?:[-_]?\d+)+$", "", p.stem), p.suffix)
+        if key not in groups:
+            order.append(key)
+        groups[key].append(p)
+
+    result = []
+    for key in order:
+        members = groups[key]
+        if len(members) >= min_group_size:
+            _, collapsed_stem, suffix = key
+            result.append((collapsed_stem, suffix, sorted(members, key=lambda p: p.name)))
+        else:
+            result.extend(members)
+    return result
+
+
+MOONRAKER_TIMESTAMP_BACKUP_RE = re.compile(r"^.+-\d{8}_\d{6}$")
+
+
+def is_backup_config(path: Path) -> bool:
+    """Return True for archival copies that should not count as live config."""
+    parts = {part.lower() for part in path.parts}
+    name = path.name.lower()
+    stem = path.stem.lower()
+    return (
+        "archive" in parts
+        or "backup" in parts
+        or "backups" in parts
+        or "orphan" in parts
+        or "disabled" in parts
+        or "backup_review" in parts
+        or "hidden_review" in parts
+        or ".bak" in name
+        or "bak" in stem
+        or stem.endswith(("_old", "_orig", "_copy"))
+        # Moonraker's automatic "Save & Restart" config backups, e.g.
+        # printer-20250730_072747.cfg -- a live-looking filename stem
+        # followed by a YYYYMMDD_HHMMSS timestamp suffix.
+        or bool(MOONRAKER_TIMESTAMP_BACKUP_RE.match(stem))
+    )
+
+
+def echo_quarantine_pairs(reporter: "Reporter", tag: str, pairs: list[tuple[Path, Path]], config_dir: Path):
+    """Print a list of (src, dst) quarantine pairs -- either a dry-run
+    preview or a completed move -- using the same collapsing rule as the
+    orphan/filtered/hidden detection listing above: any run of 3+ source
+    files that only differ by an embedded date/serial number (e.g.
+    Moonraker's printer-<timestamp>.cfg auto-backups) is folded into one
+    count + oldest/newest line instead of one line per file, so every
+    file-listing section of the report handles rotating backups the same
+    way.
+    """
+    by_src = {src: dst for src, dst in pairs}
+    for group in collapse_repetitive_files([src for src, _ in pairs]):
+        if isinstance(group, Path):
+            src = group
+            dst = by_src[src]
+            reporter.echo(f"[{tag}] {short_display_path(src, config_dir)}  ->  {short_display_path(dst, config_dir)}")
+        else:
+            collapsed_stem, suffix, members = group
+            oldest, newest = members[0], members[-1]
+            dst_dir = by_src[oldest].parent
+            reporter.echo(
+                f"[{tag}] {len(members)}x rotating backup files matching '{collapsed_stem}*{suffix}' "
+                f"(oldest: {short_display_path(oldest, config_dir)}, newest: {short_display_path(newest, config_dir)})"
+                f"  ->  {short_display_path(dst_dir, config_dir)}/ (same relative layout preserved)"
+            )
+
+
+def active_macro_table(sections) -> dict[Path, list[str]]:
+    """Group included macro definitions by their source .cfg file."""
+    table = defaultdict(list)
+    for section_name, definitions in sections.items():
+        if not section_name.startswith(("gcode_macro ", "delayed_gcode ")):
+            continue
+        for display_name, path, line_number, _in_save_config in definitions:
+            table[path].append(f"{display_name} (line {line_number})")
+    return {
+        path: sorted(names, key=str.casefold)
+        for path, names in sorted(table.items(), key=lambda item: str(item[0]).casefold())
+    }
+
+
+class Reporter:
+    def __init__(self, output_path: Path | None = None, no_file: bool = False, max_width: int = 120):
+        self.lines: list[str] = []
+        self.output_path = output_path
+        self.no_file = no_file
+        self.max_width = max_width
+
+    def section(self, title: str, note: str | None = None):
+        """Print a major '=== Title ===' header with a thin divider line
+        underneath it for visual separation, and an optional short note
+        (e.g. which flag to use to move/clean the files reported below).
+        """
+        self.echo(f"\n=== {title} ===")
+        self.echo("-" * min(len(title) + 8, self.max_width))
+        if note:
+            self.echo(f"  \u2139 {note}")
+
+    def subsection(self, title: str, note: str | None = None):
+        """Print a lighter '--- Title ---' divider for a category of files
+        nested inside a larger section (e.g. the disabled/orphan/filtered/
+        hidden groupings under the orphan-scan section), with an optional
+        short note on how to move or clean the files listed below it.
+        """
+        self.echo(f"\n--- {title} ---")
+        if note:
+            self.echo(f"  \u2139 {note}")
+
+    def echo(self, text: str = ""):
+        # NOTE: output is buffered into self.lines only -- nothing is printed
+        # to stdout here. This lets main() splice a top-of-report score/scan
+        # summary in at an earlier line index (computed from tallies that are
+        # only known once all checks below it have run) before anything is
+        # shown to the user. Call flush() once, after all sections (and any
+        # splice) are done, to print the final buffered report.
+        if not text:
+            self.lines.append("")
+            return
+
+        # Check for multi-line block
+        for raw_line in text.splitlines():
+            # If line is indented with bullets, tags, or indentation, wrap preserving indent
+            match_indent = re.match(r"^(\s*(?:•\s*|->\s*|\[[A-Z0-9!_\s]+\]\s*)?)", raw_line)
+            lead = match_indent.group(1) if match_indent else ""
+            if len(raw_line) > self.max_width and not raw_line.startswith("└──") and not raw_line.startswith("├──") and not raw_line.startswith("│"):
+                indent = " " * len(lead) if lead.strip().startswith("[") or lead.strip().startswith("•") or lead.strip().startswith("->") else " " * (len(raw_line) - len(raw_line.lstrip()))
+                wrapped = textwrap.fill(raw_line, width=self.max_width, subsequent_indent="       " if not indent else indent)
+                self.lines.append(wrapped)
+            else:
+                self.lines.append(raw_line)
+
+    def flush(self):
+        """Print the full buffered report to stdout in one pass. Call this
+        once, after all sections (and any splice-in of a top summary) are
+        complete, since echo() no longer prints in real time."""
+        print("\n".join(self.lines))
+
+    def write_report(self):
+        if self.no_file or self.output_path is None:
+            return
+        try:
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            self.output_path.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
+            print(f"\n[REPORT WRITTEN] -> {self.output_path}")
+        except OSError as exc:
+            print(f"\n[!] WARN: Could not write report file {self.output_path}: {exc}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Kinematicdigit's JWP Migration Preflight & Klipper Config Hygiene Scrubber."
+    )
+    parser.add_argument(
+        "config",
+        type=Path,
+        help="path to printer.cfg (recursively follows [include ...] directives)",
+    )
+    parser.add_argument(
+        "--general-hygiene",
+        action="store_true",
+        help="run in general hygiene mode (scans duplicates/broken includes without JWP-specific checks)",
+    )
+    parser.add_argument(
+        "--tree",
+        action="store_true",
+        help="display an ASCII tree of all resolved [include ...] dependencies",
+    )
+    parser.add_argument(
+        "--find-orphans",
+        action="store_true",
+        help="scan for unreferenced live .cfg files; ignore archive/backup copies",
+    )
+    parser.add_argument(
+        "--macro-table",
+        action="store_true",
+        help="list active gcode_macro and delayed_gcode definitions grouped by source .cfg",
+    )
+    parser.add_argument(
+        "--gcode-stats",
+        action="store_true",
+        help="report G-code file count, total size, largest files, and free disk space in the gcodes folder",
+    )
+    parser.add_argument(
+        "--gcode-dir",
+        type=Path,
+        default=None,
+        help="override the gcodes folder location (defaults to the printer_data/gcodes sibling of the config folder)",
+    )
+    parser.add_argument(
+        "--log-stats",
+        action="store_true",
+        help="report logs folder size, rotated log backups, and crash-dump archives",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="override the logs folder location (defaults to the printer_data/logs sibling of the config folder)",
+    )
+    parser.add_argument(
+        "--quarantine-orphans",
+        action="store_true",
+        help="move unreferenced .cfg files found by --find-orphans into an 'orphan/' folder, preserving their relative subdirectory layout. Dry-run by default -- add --confirm to actually move files.",
+    )
+    parser.add_argument(
+        "--quarantine-disabled",
+        action="store_true",
+        help="move files whose only reference is a commented-out [include ...] into a 'disabled/' folder (kept separate from true orphans since they may be re-enabled later). Dry-run by default -- add --confirm to actually move files.",
+    )
+    parser.add_argument(
+        "--quarantine-filtered",
+        action="store_true",
+        help="move archival/backup-named files (see --find-orphans) into a 'backup_review/' folder for deletion consideration, instead of leaving them scattered in the config folder. Dry-run by default -- add --confirm to actually move files.",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="actually perform the move for --quarantine-orphans/--quarantine-disabled/--quarantine-filtered (without this, they only print what would be moved)",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=Path,
+        default=None,
+        help="custom path to save report output (defaults to <config_dir>/jwp_hygiene_report.txt)",
+    )
+    parser.add_argument(
+        "--no-file",
+        action="store_true",
+        help="disable writing the report file to disk",
+    )
+    args = parser.parse_args()
+    config_dir = args.config.resolve().parent
+
+    # Determine default report path if not specified
+    report_path = args.output
+    if report_path is None and not args.no_file:
+        report_path = args.config.resolve().parent / "jwp_hygiene_report.txt"
+
+    reporter = Reporter(output_path=report_path, no_file=args.no_file)
+
+    sections = defaultdict(list)
+    macros = defaultdict(list)
+    renames = []
+    root_entries = []
+    visited_includes = []
+    syntax_issues = []
+    section_options = defaultdict(dict)
+    pin_assignments = defaultdict(list)
+    missing = []
+    visited = set()
+    disabled_includes = []
+    risky_calls = []
+    true_orphans = []  # populated only if --find-orphans; kept [] otherwise so
+                        # the end-of-report scoring can safely reference it.
+
+    root_node = IncludeNode(args.config.resolve())
+    scan(args.config, sections, macros, renames, root_entries, visited_includes,
+         syntax_issues, section_options, pin_assignments, visited, missing,
+         node=root_node, is_root=True, disabled_includes=disabled_includes,
+         risky_calls=risky_calls)
+
+    header = "=== KLIPPER CONFIG HYGIENE SCRUBBER (by Kinematicdigit) ===" if args.general_hygiene else "=== JWP 2.0 MIGRATION PREFLIGHT & HYGIENE SCRUBBER (by Kinematicdigit) ==="
+    reporter.echo(header)
+    reporter.echo(f"Revision {SCRIPT_REVISION} (updated {SCRIPT_REVISION_DATE}) -- Report generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    reporter.echo(f"Author / Maintainer: {SCRIPT_AUTHOR} -- {SCRIPT_PROJECT_URL}")
+    reporter.echo(f"Scanned {len(visited)} file(s) starting from {short_display_path(args.config, config_dir)}")
+    blockers = 0
+    total_warn = 0
+    total_info = 0
+    # (label, passed cleanly?, finding count) -- built up as each check below
+    # runs, then rendered as a "Scan Summary" / score banner spliced in near
+    # the top of the report (see insert_idx below) once every check has run.
+    scan_summary: list[tuple[str, bool, int]] = []
+
+    # Detected Machine Profile Overview
+    kinematics = "unknown"
+    for (p, sec, in_s), o_dict in section_options.items():
+        if sec.lower() == "printer" and not in_s and "kinematics" in o_dict:
+            kinematics = o_dict["kinematics"][1]
+            break
+
+    x_bounds = "unknown"
+    y_bounds = "unknown"
+    z_bounds = "unknown"
+    for (p, sec, in_s), o_dict in section_options.items():
+        if not in_s:
+            if sec.lower() == "stepper_x" and "position_max" in o_dict:
+                x_bounds = f"{o_dict.get('position_min', (0, '0'))[1]} to {o_dict['position_max'][1]} mm"
+            elif sec.lower() == "stepper_y" and "position_max" in o_dict:
+                y_bounds = f"{o_dict.get('position_min', (0, '0'))[1]} to {o_dict['position_max'][1]} mm"
+            elif sec.lower() == "stepper_z" and "position_max" in o_dict:
+                z_bounds = f"{o_dict.get('position_min', (0, '0'))[1]} to {o_dict['position_max'][1]} mm"
+
+    mcus = [sec for (sec, p, ln, in_s) in [item for sublist in sections.values() for item in sublist] if sec.lower().startswith("mcu") and not in_s]
+    mcu_names = sorted(list(set(mcus))) if mcus else ["none detected"]
+
+    reporter.section("Detected Printer Hardware Profile")
+    reporter.echo(f"  • Kinematics:       {kinematics}")
+    reporter.echo(f"  • X Travel Bounds:  {x_bounds}")
+    reporter.echo(f"  • Y Travel Bounds:  {y_bounds}")
+    reporter.echo(f"  • Z Travel Bounds:  {z_bounds}")
+    reporter.echo(f"  • MCUs Detected:    {', '.join(f'[{m}]' for m in mcu_names)}")
+    leveling_sys = []
+    if "quad_gantry_level" in sections: leveling_sys.append("Quad Gantry Level (QGL)")
+    if "z_tilt" in sections: leveling_sys.append("Z-Tilt Adjust")
+    if "bed_mesh" in sections: leveling_sys.append("Bed Mesh")
+    reporter.echo(f"  • Leveling Systems: {', '.join(leveling_sys) if leveling_sys else 'None / Standard'}")
+
+    reporter.section("Report Legend & Status Key")
+    reporter.echo("  • [!] BOOT-BLOCKER : Action required. Klipper will fail to start/connect until resolved (e.g. duplicate sections/macros, MCU pin collisions).")
+    reporter.echo("  • [!] RUNTIME-ERROR: Action required. Config boots, but homing/probing/mesh moves will abort or crash (e.g. travel/offset limits).")
+    reporter.echo("  • [WARN]           : Action recommended. Syntax issue, active conflicting probe to remove, or missing helper.")
+    reporter.echo("  • [INFO]           : Non-fatal notice / awareness only. Normal operation (e.g. optional modules, rename_existing wrappers).")
+    reporter.echo("  • [KEEP]           : Required setting verified. Retain this native hardware configuration.")
+    reporter.echo("  • [OK]             : Check passed successfully.")
+
+    # Everything from here down is detail content. The score/scan-summary
+    # banner computed at the very end of main() (once all tallies below are
+    # final) gets spliced into reporter.lines at this index, so it appears
+    # near the top of the printed/saved report instead of only at the bottom.
+    insert_idx = len(reporter.lines)
+
+    if args.tree:
+        reporter.section("Include Dependency Tree")
+        # Capture ASCII tree
+        import io
+        buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            root_node.print_tree()
+        finally:
+            sys.stdout = old_stdout
+        tree_text = buf.getvalue().rstrip()
+        reporter.echo(tree_text)
+
+    if syntax_issues:
+        reporter.section("Syntax, Quote & Option Shadowing Diagnostics", "Fix the flagged line directly in the .cfg file listed; these are hand-edits, not something the scanner can move.")
+        for path, line_no, issue in syntax_issues:
+            reporter.echo(f"[WARN] {short_display_path(path, config_dir)} (line {line_no}) -> {issue}")
+        total_warn += len(syntax_issues)
+    scan_summary.append(("Syntax, Quote & Option Shadowing", not syntax_issues, len(syntax_issues)))
+
+    duplicates = {key: values for key, values in sections.items() if len(values) > 1}
+    dup_sections_blocking = 0
+    if duplicates:
+        reporter.echo("\n[!] BOOT-BLOCKER: Duplicate configuration sections found")
+        reporter.echo("  \u2139 [ORIGIN] is the first copy the scanner reaches while following your include order (usually the one to keep); [DUPLICATE] entries are candidates to rename or delete.")
+        for key, values in sorted(duplicates.items()):
+            reporter.echo(f"  [{key}]")
+            for i, (_, path, line, *_rest) in enumerate(values):
+                tag = "[ORIGIN]   " if i == 0 else "[DUPLICATE]"
+                reporter.echo(f"    {tag} {short_display_path(path, config_dir)} (line {line})")
+            if not args.general_hygiene:
+                if key in INTERESTING_SECTIONS or key.startswith("gcode_macro "):
+                    blockers += 1
+                    dup_sections_blocking += 1
+            else:
+                blockers += 1
+                dup_sections_blocking += 1
+    else:
+        reporter.echo("\n[OK] No duplicate configuration sections found")
+    scan_summary.append(("Duplicate configuration sections", not duplicates, len(duplicates)))
+
+    duplicate_macros = {key: values for key, values in macros.items() if len(values) > 1}
+    if duplicate_macros:
+        reporter.echo("\n[!] BOOT-BLOCKER: Duplicate gcode_macro command definitions")
+        reporter.echo("  \u2139 [ORIGIN] is the first copy the scanner reaches while following your include order (usually the one to keep); [DUPLICATE] entries are candidates to rename or delete.")
+        for key, values in sorted(duplicate_macros.items()):
+            reporter.echo(f"  {values[0][0]}")
+            for i, (_, path, line, *_rest) in enumerate(values):
+                tag = "[ORIGIN]   " if i == 0 else "[DUPLICATE]"
+                reporter.echo(f"    {tag} {short_display_path(path, config_dir)} (line {line})")
+        blockers += len(duplicate_macros)
+    else:
+        reporter.echo("[OK] No duplicate gcode_macro commands found")
+    scan_summary.append(("Duplicate gcode_macro definitions", not duplicate_macros, len(duplicate_macros)))
+
+    if risky_calls:
+        reporter.section(
+            "Risky / Deprecated G-code Commands In Macros",
+            "These bypass Klipper's normal safety/kinematic checks and are meant for manual bench calibration only -- review each and remove or gate it if it isn't needed anymore.",
+        )
+        by_macro = defaultdict(list)
+        for macro_name, path, line_no, raw_line, label, reason in risky_calls:
+            by_macro[(macro_name, path)].append((line_no, raw_line, label, reason))
+        for (macro_name, path), calls in sorted(by_macro.items(), key=lambda kv: (str(kv[0][1]), kv[0][0])):
+            reporter.echo(f"  [{macro_name}]  ({short_display_path(path, config_dir)})")
+            for line_no, raw_line, label, reason in sorted(calls):
+                reporter.echo(f"    [WARN] line {line_no}: {raw_line}")
+                reporter.echo(f"           {label} -- {reason}")
+        total_warn += len(risky_calls)
+    else:
+        reporter.echo("[OK] No risky/deprecated G-code commands (FORCE_MOVE, SET_KINEMATIC_POSITION, STEPPER_BUZZ, SET_STEPPER, M302 P1) found in macro bodies")
+    scan_summary.append(("Risky/deprecated G-code commands", not risky_calls, len(risky_calls)))
+
+
+    # Hardware & calibration sanity checks: kept as its own section,
+    # separate from include-order/structural/pin/kinematic hygiene below,
+    # since these are about suspicious *values* (TMC current, stale PID
+    # tuning, autotune plugin conflicts, orphaned SAVE_CONFIG entries)
+    # rather than the layout/structure of the config itself.
+    calibration_warnings = check_hardware_calibration_sanity(sections, section_options)
+    if calibration_warnings:
+        reporter.section(
+            "Hardware & Calibration Sanity Checks",
+            "Values here are syntactically valid but numerically suspicious or stale -- review the specific setting mentioned in each line.",
+        )
+        for tag, warn in calibration_warnings:
+            reporter.echo(f"{tag} {warn}")
+            if "BLOCKER" in tag or "RUNTIME-ERROR" in tag:
+                blockers += 1
+            elif tag == "[WARN]":
+                total_warn += 1
+            elif tag == "[INFO]":
+                total_info += 1
+    else:
+        reporter.echo("[OK] No suspicious TMC current, stale PID tuning, autotune_tmc conflicts, or orphaned SAVE_CONFIG entries found")
+    scan_summary.append(("Hardware & Calibration Sanity", not calibration_warnings, len(calibration_warnings)))
+
+    # Print/pause/cancel/resume lifecycle hygiene: PRINT_START vs. slicer
+    # placeholder leakage, missing end-of-job shutdown steps, a PAUSE that
+    # would lose position, unguarded optional-hardware calls, and duplicate
+    # PRINT_START parameter naming across multiple definitions.
+    idle_timeout_seconds = None
+    for (p, sec, in_s), o_dict in section_options.items():
+        if sec.lower() == "idle_timeout" and not in_s and "timeout" in o_dict:
+            idle_timeout_seconds = _first_token_float(o_dict["timeout"][1])
+            break
+    lifecycle_warnings = check_print_lifecycle_macros(macros, config_dir, idle_timeout_seconds)
+    if lifecycle_warnings:
+        reporter.section(
+            "Print / Pause / Cancel / Resume Lifecycle Hygiene",
+            "Checked directly against PRINT_START, PRINT_END, CANCEL_PRINT, PAUSE, M600 and RESUME macro bodies -- review the specific macro/line mentioned in each line.",
+        )
+        for tag, warn in lifecycle_warnings:
+            reporter.echo(f"{tag} {warn}")
+            if "BLOCKER" in tag or "RUNTIME-ERROR" in tag:
+                blockers += 1
+            elif tag == "[WARN]":
+                total_warn += 1
+            elif tag == "[INFO]":
+                total_info += 1
+    else:
+        reporter.echo("[OK] No missing end-of-job shutdown steps, unguarded optional-hardware calls, slicer placeholder leakage, or PRINT_START parameter mismatches found in print/pause/cancel/resume macros")
+    scan_summary.append(("Print/Pause/Cancel/Resume Lifecycle Hygiene", not lifecycle_warnings, len(lifecycle_warnings)))
+
+    # Print Start/End G-code: slicer compatibility & deprecated-command
+    # hygiene. Detects legacy Marlin/RepRapFirmware commands (G29, M420,
+    # M900, M572, M203, M201, M205, M907) left inside PRINT_START/
+    # PRINT_END/CANCEL_PRINT bodies, and surfaces a reference note on the
+    # top-3-slicer Klipper integration conventions.
+    slicer_compat_warnings = check_slicer_start_end_compat(macros, config_dir)
+    if slicer_compat_warnings:
+        reporter.section(
+            "Print Start/End G-code: Slicer Compatibility & Deprecated Command Hygiene",
+            "Legacy Marlin/RepRapFirmware commands found inside PRINT_START/PRINT_END/CANCEL_PRINT bodies, plus reference notes on top-3-slicer Klipper integration conventions.",
+        )
+        for tag, warn in slicer_compat_warnings:
+            reporter.echo(f"{tag} {warn}")
+            if "BLOCKER" in tag or "RUNTIME-ERROR" in tag:
+                blockers += 1
+            elif tag == "[WARN]":
+                total_warn += 1
+            elif tag == "[INFO]":
+                total_info += 1
+    else:
+        reporter.echo("[OK] No legacy Marlin/RepRapFirmware commands (G29, M420, M900, M572, M203, M201, M205, M907) found inside PRINT_START/PRINT_END/CANCEL_PRINT macro bodies")
+    scan_summary.append(("Print Start/End G-code Slicer Compatibility", not slicer_compat_warnings, len(slicer_compat_warnings)))
+
+    # Order, structural, pins & temperature hygiene checks
+    order_warnings = check_ordering_and_hygiene(root_entries, sections, visited_includes, section_options, pin_assignments, config_dir)
+    if order_warnings:
+        reporter.section("Include Ordering, Structural, Pin & Kinematic Hygiene")
+        for tag, warn in order_warnings:
+            reporter.echo(f"{tag} {warn}")
+            if "BLOCKER" in tag or "RUNTIME-ERROR" in tag:
+                blockers += 1
+            elif tag == "[WARN]":
+                total_warn += 1
+            elif tag == "[INFO]":
+                total_info += 1
+    else:
+        reporter.echo("[OK] No include-order, structural, pin, or kinematic hygiene issues found")
+    scan_summary.append(("Include Ordering/Structural/Pin/Kinematic Hygiene", not order_warnings, len(order_warnings)))
+
+    if args.macro_table:
+        reporter.section("Active Macro Definitions by Included .cfg File")
+        macro_table = active_macro_table(sections)
+        if macro_table:
+            for path, names in macro_table.items():
+                reporter.echo(f"{short_display_path(path, config_dir)}")
+                for name in names:
+                    reporter.echo(f"  - {name}")
+        else:
+            reporter.echo("[OK] No active gcode_macro or delayed_gcode definitions found.")
+
+    if args.gcode_stats:
+        reporter.section("G-code File Storage", "Rotated old prints found here are just plain files -- delete manually via your file manager/SSH if space is tight.")
+        gcodes_dir = args.gcode_dir if args.gcode_dir is not None else config_dir.parent / "gcodes"
+        stats = gcode_folder_stats(gcodes_dir)
+        if stats is None:
+            reporter.echo(f"[WARN] Could not find gcodes folder at {short_display_path(gcodes_dir, config_dir)}; use --gcode-dir to point at the right location.")
+        else:
+            reporter.echo(f"Folder: {short_display_path(gcodes_dir, config_dir)}")
+            reporter.echo(f"{stats['count']} G-code file(s) totaling {human_size(stats['total_size'])}")
+            if stats["disk_total"] is not None:
+                used_pct = 100 * (stats["disk_total"] - stats["disk_free"]) / stats["disk_total"] if stats["disk_total"] else 0
+                reporter.echo(f"Disk: {human_size(stats['disk_free'])} free of {human_size(stats['disk_total'])} ({used_pct:.0f}% used)")
+                if used_pct >= 90:
+                    reporter.echo("[WARN] Disk usage is above 90%; consider deleting old G-code files or backups.")
+            if stats["largest"]:
+                reporter.echo("Largest files:")
+                for entry, size in stats["largest"]:
+                    reporter.echo(f"  - {short_display_path(entry, config_dir.parent)} ({human_size(size)})")
+
+    if args.log_stats:
+        reporter.section("Log File Storage", "Rotated log backups and crash-dump archives (listed below) are safe to delete manually if disk space is tight.")
+        logs_dir = args.log_dir if args.log_dir is not None else config_dir.parent / "logs"
+        stats = log_folder_stats(logs_dir)
+        if stats is None:
+            reporter.echo(f"[WARN] Could not find logs folder at {short_display_path(logs_dir, config_dir)}; use --log-dir to point at the right location.")
+        else:
+            reporter.echo(f"Folder: {short_display_path(logs_dir, config_dir)}")
+            reporter.echo(f"{stats['count']} file(s) totaling {human_size(stats['total_size'])}")
+            reporter.echo(f"Rotated log backups: {stats['rotated_count']} file(s), {human_size(stats['rotated_size'])}")
+            reporter.echo(f"Crash-dump archives: {stats['crash_dump_count']} file(s), {human_size(stats['crash_dump_size'])}")
+            if stats["rotated_count"] or stats["crash_dump_count"]:
+                reporter.echo("[INFO] Rotated logs and crash dumps are safe to delete manually if disk space is tight.")
+            if stats["largest"]:
+                reporter.echo("Largest files:")
+                for entry, size in stats["largest"]:
+                    reporter.echo(f"  - {short_display_path(entry, config_dir.parent)} ({human_size(size)})")
+
+    if not args.general_hygiene:
+        reporter.section("JWP 2.0 Readiness & Ownership Checks")
+        missing_required_count = 0
+        for key in sorted(INTERESTING_SECTIONS):
+            if key == "homing_override":
+                continue
+            values = sections.get(key, [])
+            if values:
+                reporter.echo(f"[KEEP] [{key}] -> {locations(values, config_dir)}")
+            elif key in {"stepper_x", "stepper_y", "stepper_z", "probe"}:
+                reporter.echo(f"[ERROR] Missing required [{key}] section")
+                blockers += 1
+                missing_required_count += 1
+            else:
+                reporter.echo(f"[INFO] Absent [{key}] (JWP will treat it as optional)")
+        scan_summary.append(("Required Sections Present (stepper_x/y/z, probe)", missing_required_count == 0, missing_required_count))
+
+        probe_files = sections.get("probe", [])
+        nhk_files = sections.get("mcu nhk", [])
+        nitehawk_probe_conflict = any("nitehawk" in str(path).lower() for _, path, _, _ in probe_files)
+        if nitehawk_probe_conflict:
+            reporter.echo("[WARN] [probe] is declared in a Nitehawk file; comment it out and let JWP own [probe]")
+            total_warn += 1
+        if nhk_files:
+            reporter.echo("[OK] Nitehawk MCU [mcu nhk] detected; keep its extruder/fan/LED wiring")
+
+        legacy = []
+        for name in sorted(LEGACY_MACROS):
+            if name in macros:
+                # Only flag as legacy conflict if declared in a non-JWP file
+                non_jwp_defs = [m for m in macros[name] if "jabberwocky" not in str(m[1]).lower() and "jwprobe" not in str(m[1]).lower()]
+                if non_jwp_defs:
+                    legacy.append(name)
+                    reporter.echo(f"[WARN] Found legacy macro [{name}] -> {locations(non_jwp_defs, config_dir)}")
+                    total_warn += 1
+        if not legacy:
+            reporter.echo("[OK] No conflicting legacy probe/dock macro names found")
+
+        # Check for active non-JWP probe sections
+        other_probe_findings = []
+        for sec_key, desc in OTHER_PROBE_SECTIONS.items():
+            if sec_key in sections:
+                other_probe_findings.append((sec_key, desc, sections[sec_key]))
+        if other_probe_findings:
+            reporter.section("Other Probe Systems Detected in Config", "Remove/uninstall these to avoid conflicting with JWP -- see the suggestion under each entry below.")
+            for sec_key, desc, locs in other_probe_findings:
+                reporter.echo(f"[WARN] Found active [{sec_key}] ({desc}) at {locations(locs, config_dir)}.")
+                reporter.echo(f"       -> If migrating to JWP, remove/uninstall this probe configuration and its calibration macros to keep your machine clean.")
+            total_warn += len(other_probe_findings)
+
+        # Check for other probe include files
+        other_inc_findings = []
+        for inc_path, parent_f, line_n in visited_includes:
+            for pat, probe_label in OTHER_PROBE_INCLUDE_PATTERNS:
+                if pat.search(inc_path) and "jabberwocky" not in inc_path.lower():
+                    other_inc_findings.append((probe_label, inc_path, parent_f, line_n))
+                    break
+        if other_inc_findings:
+            reporter.section("Other Probe Includes Detected", "Comment out or uninstall these include files to prevent duplicate homing/leveling macros.")
+            for label, inc_p, parent_f, line_n in other_inc_findings:
+                reporter.echo(f"[WARN] Found [include {inc_p}] ({label}) at {parent_f} (line {line_n})")
+                reporter.echo(f"       -> Suggestion: Uninstall/comment out this probe include file to prevent duplicate homing/leveling macros.")
+            total_warn += len(other_inc_findings)
+        scan_summary.append((
+            "JWP Ownership Checks (Nitehawk/legacy macros/other probe systems)",
+            not (nitehawk_probe_conflict or legacy or other_probe_findings or other_inc_findings),
+            (1 if nitehawk_probe_conflict else 0) + len(legacy) + len(other_probe_findings) + len(other_inc_findings),
+        ))
+
+
+        # JWP Integration & Setup Suggestions
+        has_jwp_include = any("jwprobe_entry" in inc.lower() or "jabberwockyprobe" in inc.lower() for inc, _, _ in visited_includes)
+        reporter.section("JWP 2.0 Integration & Setup Suggestions")
+        if has_jwp_include:
+            reporter.echo("[OK] JWP master include [include jabberwockyprobe/jwprobe_entry.cfg] is active in your configuration.")
+            missing_onboarding = [
+                (name, purpose)
+                for name, purpose in JWP_REQUIRED_ONBOARDING_MACROS.items()
+                if name not in macros
+            ]
+            if missing_onboarding:
+                reporter.echo("[!] RUNTIME-ERROR: Active JWP install is incomplete or outdated; required five-step onboarding commands are missing:")
+                for name, purpose in missing_onboarding:
+                    reporter.echo(f"       {name.upper():<38} {purpose}")
+                reporter.echo("       Update the complete jabberwockyprobe/ folder, then run FIRMWARE_RESTART.")
+                blockers += len(missing_onboarding)
+            else:
+                reporter.echo("[OK] Complete five-step JWP onboarding command set is present, including explicit dock clearance and bed-envelope verification.")
+            scan_summary.append((
+                "JWP Five-Step Onboarding Command Set",
+                not missing_onboarding,
+                len(missing_onboarding),
+            ))
+        else:
+            reporter.echo("[INFO] JWP is not yet included in printer.cfg.")
+            reporter.echo("       Add this line to printer.cfg (recommended after core stepper/mcu sections):")
+            reporter.echo("       [include jabberwockyprobe/jwprobe_entry.cfg]")
+
+        if "quad_gantry_level" in sections:
+            reporter.echo("       • QGL detected: to enable automatic probe deploy/retract on Mainsail/Fluidd's QGL button, uncomment in jwprobe_entry.cfg:")
+            reporter.echo("         [include jwprobe_qgl.cfg]")
+        elif "z_tilt" in sections:
+            reporter.echo("       • Z-Tilt detected: to enable automatic probe deploy/retract on Mainsail/Fluidd's Z-Tilt button, uncomment in jwprobe_entry.cfg:")
+            reporter.echo("         [include jwprobe_z_tilt.cfg]")
+
+        if "bed_mesh" in sections:
+            reporter.echo("       • Bed Mesh detected: to enable automatic probe deploy/retract on Mainsail/Fluidd's Bed Mesh button, uncomment in jwprobe_entry.cfg:")
+            reporter.echo("         [include jwprobe_bed_mesh.cfg]")
+
+    if renames:
+        reporter.section("Macro rename_existing Wrappers", "Standard wrappers (e.g. Mainsail/Fluidd PAUSE/RESUME, Bedfans) are normal. Verify only unexpected wrappers.")
+        for section, target, path, line in renames:
+            reporter.echo(f"[INFO] rename_existing: '{target}' in [{section}] at {short_display_path(path, config_dir)} (line {line})")
+
+    if missing:
+        reporter.echo("\n[!] WARN: Unresolved or missing [include] path(s)")
+        for item in missing:
+            reporter.echo(f"  {item}")
+
+    if args.find_orphans:
+        all_orphans, disabled_paths, dangling_includes, filtered_files, hidden_files = find_orphaned_configs(args.config, visited, disabled_includes)
+        true_orphans = [p for p in all_orphans if p.resolve() not in disabled_paths]
+        disabled_orphans = [p for p in all_orphans if p.resolve() in disabled_paths]
+        reporter.section("Orphaned / Unreferenced .cfg Files in Config Folder")
+        reporter.echo(
+            f"Summary: {len(disabled_orphans)} disabled, {len(true_orphans)} unreferenced, "
+            f"{len(filtered_files)} filtered (archival/backup), {len(hidden_files)} hidden dotfile(s)."
+        )
+
+        def echo_file_group(tag: str, files: list[Path], note: str = ""):
+            """Print each file in `files` tagged with `tag`, collapsing any
+            run of 3+ files that only differ by an embedded date/serial
+            number (e.g. Moonraker's printer-<timestamp>.cfg auto-backups)
+            into a single count + oldest/newest line instead of one line
+            per file, so a config with dozens of rotating backups doesn't
+            drown out everything else in the report."""
+            for item in collapse_repetitive_files(files):
+                if isinstance(item, Path):
+                    reporter.echo(f"[{tag}] {short_display_path(item, config_dir)}")
+                else:
+                    collapsed_stem, suffix, members = item
+                    oldest, newest = members[0], members[-1]
+                    reporter.echo(
+                        f"[{tag}] {len(members)}x rotating backup files matching '{collapsed_stem}*{suffix}' "
+                        f"(oldest: {short_display_path(oldest, config_dir)}, newest: {short_display_path(newest, config_dir)})"
+                        f"{' -- ' + note if note else ''}"
+                    )
+
+        if disabled_orphans:
+            reporter.subsection(
+                "Disabled (commented-out include, not orphaned)",
+                "Re-enable by uncommenting the [include ...] line, or stage for review with --quarantine-disabled (add --confirm to move).",
+            )
+            echo_file_group("DISABLED", disabled_orphans)
+
+        if true_orphans:
+            reporter.subsection(
+                "Unreferenced (no [include ...] reaches these at all)",
+                "Move for review with --quarantine-orphans (add --confirm to actually move).",
+            )
+            echo_file_group("INFO", true_orphans)
+        elif not disabled_orphans:
+            reporter.echo("[OK] No unreferenced .cfg files found in config folder.")
+        else:
+            reporter.echo("[OK] No truly unreferenced .cfg files found (all remaining candidates are commented-out/disabled includes above).")
+
+        if filtered_files:
+            reporter.subsection(
+                "Filtered (archival/backup-named, excluded from counts above)",
+                "Move for deletion review with --quarantine-filtered (add --confirm to actually move).",
+            )
+            echo_file_group("FILTERED", filtered_files, "likely auto-generated (e.g. Mainsail/Fluidd \"Save & Restart\" config backups); safe to prune old copies by hand, or move the whole group with --quarantine-filtered")
+
+        if hidden_files:
+            reporter.subsection(
+                "Hidden (dotfiles, likely editor swap/backup artifacts)",
+                "Move for deletion review with --quarantine-filtered (add --confirm to actually move).",
+            )
+            echo_file_group("HIDDEN", hidden_files)
+
+
+        orphans = true_orphans
+        if args.quarantine_orphans:
+            reporter.section("Quarantine Orphaned .cfg Files", "Destination: config/orphan/ (subdirectory layout preserved).")
+            if not orphans:
+                reporter.echo("[OK] Nothing to quarantine.")
+            else:
+                orphan_root = config_dir / "orphan"
+                if not args.confirm:
+                    reporter.echo("[INFO] DRY RUN (no files moved) -- pass --confirm to actually move these files:")
+                    pairs = [(o, orphan_root / o.resolve().relative_to(config_dir)) for o in orphans]
+                    echo_quarantine_pairs(reporter, "PREVIEW", pairs, config_dir)
+                else:
+                    moved, errors = quarantine_files(orphans, config_dir, orphan_root)
+                    echo_quarantine_pairs(reporter, "MOVED", moved, config_dir)
+                    for src, exc in errors:
+                        reporter.echo(f"[!] WARN: Could not move {short_display_path(src, config_dir)}: {exc}")
+                    reporter.echo(f"Quarantined {len(moved)} file(s) into {short_display_path(orphan_root, config_dir)}/ (subdirectory layout preserved).")
+
+        if args.quarantine_disabled:
+            reporter.section("Quarantine Disabled (Commented-Out Include) .cfg Files", "Destination: config/disabled/. Re-enable later by uncommenting the [include ...] line and moving the file back.")
+            if not disabled_orphans:
+                reporter.echo("[OK] Nothing to quarantine.")
+            else:
+                disabled_root = config_dir / "disabled"
+                if not args.confirm:
+                    reporter.echo("[INFO] DRY RUN (no files moved) -- pass --confirm to actually move these files:")
+                    pairs = [(f, disabled_root / f.resolve().relative_to(config_dir)) for f in disabled_orphans]
+                    echo_quarantine_pairs(reporter, "PREVIEW", pairs, config_dir)
+                else:
+                    moved, errors = quarantine_files(disabled_orphans, config_dir, disabled_root)
+                    echo_quarantine_pairs(reporter, "MOVED", moved, config_dir)
+                    for src, exc in errors:
+                        reporter.echo(f"[!] WARN: Could not move {short_display_path(src, config_dir)}: {exc}")
+                    reporter.echo(f"Quarantined {len(moved)} file(s) into {short_display_path(disabled_root, config_dir)}/ (subdirectory layout preserved). Re-enable by uncommenting the [include ...] line and moving the file back.")
+
+        if args.quarantine_filtered:
+            reporter.section("Quarantine Archival/Backup & Hidden .cfg Files", "Destination: config/backup_review/. Review and delete manually once confirmed unneeded.")
+            review_targets = filtered_files + hidden_files
+            if not review_targets:
+                reporter.echo("[OK] Nothing to quarantine.")
+            else:
+                review_root = config_dir / "backup_review"
+                if not args.confirm:
+                    reporter.echo("[INFO] DRY RUN (no files moved) -- pass --confirm to actually move these files:")
+                    pairs = [(f, review_root / f.resolve().relative_to(config_dir)) for f in review_targets]
+                    echo_quarantine_pairs(reporter, "PREVIEW", pairs, config_dir)
+                else:
+                    moved, errors = quarantine_files(review_targets, config_dir, review_root)
+                    echo_quarantine_pairs(reporter, "MOVED", moved, config_dir)
+                    for src, exc in errors:
+                        reporter.echo(f"[!] WARN: Could not move {short_display_path(src, config_dir)}: {exc}")
+                    reporter.echo(f"Quarantined {len(moved)} file(s) into {short_display_path(review_root, config_dir)}/ (subdirectory layout preserved). Review and delete manually once confirmed unneeded.")
+
+        if dangling_includes:
+            reporter.section("Dangling Commented-Out Includes", "Safe to remove the comment line itself -- the target file is gone, this is a leftover reference, not a movable file.")
+            for inc_target, parent, line in dangling_includes:
+                reporter.echo(f"[WARN] {short_display_path(parent, config_dir)} (line {line}) -> commented include target not found: {inc_target}")
+            total_warn += len(dangling_includes)
+        scan_summary.append(("Orphaned/Unreferenced .cfg Files", not true_orphans, len(true_orphans)))
+
+    # ---- Score / Scan Summary banner -----------------------------------
+    # Computed last (once every tally above is final) but spliced into
+    # reporter.lines at insert_idx, near the top of the report, so the user
+    # sees an at-a-glance result before scrolling through the full detail.
+    # 5-point scale, worst-to-best, first match wins:
+    #   1 Blockers found        3 Clean but duplicates/orphans present
+    #   2 Warnings/info found   4 Clean but with commented-out include(s)
+    #                           5 Perfect (excluding relocated/filtered files)
+    dup_or_orphan_present = bool(duplicates) or bool(duplicate_macros) or bool(true_orphans)
+    disabled_include_present = bool(disabled_includes)
+
+    if blockers > 0:
+        tier, tier_label, tier_stars = 1, "BLOCKERS FOUND", "\u2605" + "\u2606" * 4
+    elif total_warn > 0 or total_info > 0:
+        tier, tier_label, tier_stars = 2, "WARNINGS / INFO TO REVIEW", "\u2605\u2605" + "\u2606" * 3
+    elif dup_or_orphan_present:
+        tier, tier_label, tier_stars = 3, "CLEAN, BUT DUPLICATE/ORPHAN FILE(S) PRESENT", "\u2605\u2605\u2605" + "\u2606" * 2
+    elif disabled_include_present:
+        tier, tier_label, tier_stars = 4, "CLEAN, WITH COMMENTED-OUT INCLUDE(S)", "\u2605\u2605\u2605\u2605" + "\u2606"
+    else:
+        tier, tier_label, tier_stars = 5, "PERFECT (excluding relocated files)", "\u2605" * 5
+
+    summary_lines = [
+        "",
+        "================================================================================",
+        f"  SCAN RESULT SUMMARY -- {tier_stars}  ({tier}/5)  {tier_label}",
+        "================================================================================",
+    ]
+    if blockers:
+        summary_lines.append(f"  [!] {blockers} blocker/error(s) -- Klipper will fail to start or run unsafely. See details below.")
+    if total_warn or total_info:
+        summary_lines.append(f"  {total_warn} warning(s), {total_info} info notice(s) to review -- see details below.")
+    if dup_or_orphan_present and tier > 2:
+        parts = []
+        if duplicates:
+            parts.append(f"{len(duplicates)} duplicate section(s)")
+        if duplicate_macros:
+            parts.append(f"{len(duplicate_macros)} duplicate macro(s)")
+        if true_orphans:
+            parts.append(f"{len(true_orphans)} unreferenced file(s)")
+        summary_lines.append(f"  Non-blocking: {', '.join(parts)} -- not urgent, but worth a look. See details below.")
+    if disabled_include_present and tier > 3:
+        summary_lines.append(f"  {len(disabled_includes)} commented-out [include ...] line(s) found -- informational only, no action required.")
+    summary_lines.append("")
+    summary_lines.append("  What was scanned:")
+    for label, passed, count in scan_summary:
+        status = "[OK]" if passed else "[!!]"
+        detail = "100% clean" if passed else f"{count} finding(s) -- see details below"
+        summary_lines.append(f"    {status} {label:<55} {detail}")
+    summary_lines.append("================================================================================")
+    reporter.lines[insert_idx:insert_idx] = summary_lines
+
+    if blockers:
+        reporter.echo("\n================================================================================")
+        reporter.echo(f"  [!] RESULT: NOT READY ({blockers} blocker/error(s) found)")
+        reporter.echo("      Resolve duplicate or conflicting definitions listed above before proceeding.")
+        reporter.echo("================================================================================")
+        reporter.flush()
+        reporter.write_report()
+        return 1
+    
+    if not args.general_hygiene:
+        reporter.echo("\n================================================================================")
+        reporter.echo("  RESULT: PASS. Config is clean; ready to include JWP 2.0.")
+        reporter.echo("================================================================================")
+        if not has_jwp_include:
+            reporter.echo("  NEXT: Add [include jabberwockyprobe/jwprobe_entry.cfg] to printer.cfg, then")
+            reporter.echo("        FIRMWARE_RESTART and run JWP_SETUP_WIZARD to begin onboarding")
+            reporter.echo("        (Step 0 -- detects your machine profile and prints the next exact command).")
+        else:
+            reporter.echo("  NEXT: FIRMWARE_RESTART to load JWP, then run JWP_SETUP_WIZARD")
+            reporter.echo("        (Step 0 -- resumes the five-step workflow at the next incomplete action).")
+    else:
+        reporter.echo("\n================================================================================")
+        reporter.echo("  RESULT: PASS. General config hygiene check clean.")
+        reporter.echo("================================================================================")
+    reporter.flush()
+    reporter.write_report()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
