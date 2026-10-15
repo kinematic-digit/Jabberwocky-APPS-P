@@ -1,7 +1,7 @@
 # =====================================================================
 # JABBERWOCKY ECOSYSTEM — PRODUCTION COMPILER & RELEASER
 # VERSION: 2.0.0
-# Location: tools/jwp_build.py
+# Location: software/jwp_build.py
 # =====================================================================
 import os
 import sys
@@ -33,7 +33,10 @@ class JabberwockyCompiler:
         # Scan folder layout structures sequentially to maintain macro parsing order
         for root, _, files in os.walk(self.source_dir):
             for file in sorted(files):
-                if file.endswith(".cfg"):
+                if file.endswith(".cfg") and file.lower() not in {
+                    "jwprobe_vars.cfg",
+                    "jwprobe_runtime_vars.cfg",
+                }:
                     file_path = os.path.join(root, file)
                     with open(file_path, "r") as src:
                         for line in src:

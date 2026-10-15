@@ -1,6 +1,6 @@
 # =====================================================================
 # JABBERWOCKY APPS ECOSYSTEM — HARDENED REGEX UTILITIES & CONSTANTS
-# Location: scrubber/jws_utils.py
+# Location: software/macro_manager/jws_utils.py
 # =====================================================================
 import os
 import re

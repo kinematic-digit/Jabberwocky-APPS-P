@@ -659,7 +659,7 @@ actual configuration target.
 
 ### D. Scanner modularity and orphan detection
 
-Maintain the modular structure of the scrubber directory. New scanners,
+Maintain the modular structure of `software/macro_manager/`. New scanners,
 file types, and checks should be addable without requiring a rewrite of the
 entire scanner or orchestration system.
 

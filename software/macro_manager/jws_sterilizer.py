@@ -74,7 +74,7 @@ def prompt_sterilizer_safety_instructions(config_dir: Path) -> list[str]:
         "     sudo reboot",
         "  b. Refresh your web browser to ensure no old dashboard layouts are loaded.",
         "  c. Re-run this utility with explicit double flags to execute the purge:",
-        f"     python3 ~/Jabberwocky-APPS/scrubber/jws_core.py --sterilize --confirm-reboot-cache-clear",
+        f"     python3 ~/Jabberwocky-APPS/software/macro_manager/jws_core.py --sterilize --confirm-reboot-cache-clear",
         "-" * 80
     ]
     return instructions

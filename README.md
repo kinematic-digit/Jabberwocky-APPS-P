@@ -289,6 +289,33 @@ Successful installation does not establish that every feature is reliable.
 
 Do not use it as a substitute for printer maintenance, configuration backups, or established safety procedures.
 
+### Source Layout
+
+- `software/macro_manager/` contains Macro Manager state, scanning,
+  reporting, and synchronization modules; `jws_core.py` is its CLI entry.
+- `software/jw_probe/` contains JWP source and the Klipper-loadable
+  `jwp_event_tracker.py`.
+- JWP calibration persists at `~/printer_data/config/jwprobe_runtime_vars.cfg`;
+  the APPS Curses installer owns JWP package deployment and the generated
+  QGL/bed-mesh integration block. Existing hardware bindings and user globals
+  are preserved on updates.
+- The installer initializes an empty variable store only for a fresh install,
+  preserves existing data on updates, and stops automatic path migration when
+  both legacy and canonical files exist without a verified migration marker.
+- `software/jws_installer.py` and `software/curses_ui.py` provide the setup
+  workflow and interactive entry point.
+- `software/jwp_build.py` is the shared release builder.
+- `config/` contains the checked-in printer configuration; `jabberwocky_dist/`
+  contains installer distribution assets.
+
+Run the focused local regression suites from the repository root:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_macro_manager_sync.py' -v
+python3 -m unittest discover -s tests -p 'test_jwp_event_tracker.py' -v
+python3 -m unittest discover -s tests -p 'test_jwp_persistence.py' -v
+```
+
 ---
 
 ## 10. Project Repository

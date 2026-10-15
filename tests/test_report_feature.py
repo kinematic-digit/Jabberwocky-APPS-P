@@ -15,15 +15,10 @@ from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SOFTWARE_DIR = REPO_ROOT / "software"
+sys.path.insert(0, str(REPO_ROOT))
 
-# curses_ui.py imports jws_installer as a top-level module.
-for import_path in (str(REPO_ROOT), str(SOFTWARE_DIR)):
-    if import_path not in sys.path:
-        sys.path.insert(0, import_path)
-
-import curses_ui
-from scrubber import jws_core
+from software import curses_ui
+from software.macro_manager import jws_core
 
 
 class FakeScreen:

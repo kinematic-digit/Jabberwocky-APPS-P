@@ -9,7 +9,7 @@ REPO_ROOT = os.path.abspath(os.path.join(CURRENT_SCRIPT_DIR, ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-import jws_installer
+from software import jws_installer
 # Seconds to pause between on-screen steps so people can read them.
 # JWS_UI_PACE=0 disables.
 PACE = float(os.environ.get("JWS_UI_PACE", "0.7"))
@@ -33,9 +33,14 @@ class JabberwockyTerminalUI:
                 False,
             ),
             (
-                "Probe tools",
-                ("Not available yet. Planned for a future release.",),
-                False,
+                "Install / Update JWP",
+                (
+                    "Deploys or updates the Jabberwocky Probe package and read-only event tracker.",
+                    "Preserves calibration data, hardware bindings, and user globals. Manages QGL",
+                    "and bed-mesh dashboard wrappers only when the matching native sections exist.",
+                    "Review the probe pin and offsets before restarting Klipper after a fresh install.",
+                ),
+                True,
             ),
             (
                 "Report",
@@ -48,7 +53,7 @@ class JabberwockyTerminalUI:
                 True,
             ),
         )
-        self.selections = [True, False, False, False]
+        self.selections = [True, False, False]
         self.version_string = "v5.9.1"
         self.stage_lines = []
         self._scr = None
@@ -109,11 +114,25 @@ class JabberwockyTerminalUI:
     def run_pipeline(self, stdscr):
         self._scr = stdscr
         self.stage_lines = []
+        notes = []
         try:
-            jws_installer.run_installation_pipeline(progress=self.progress)
+            if self.selections[0]:
+                jws_installer.run_installation_pipeline(progress=self.progress)
+                notes.extend(jws_installer.INSTALL_NOTES)
+            if self.selections[2]:
+                jws_installer.run_jwp_installation_pipeline(progress=self.progress)
+                notes.extend(jws_installer.INSTALL_NOTES)
+            jws_installer.INSTALL_NOTES[:] = notes
             return None
         except Exception as exc:
+            if notes:
+                jws_installer.INSTALL_NOTES[:] = notes + jws_installer.INSTALL_NOTES
             return str(exc) or exc.__class__.__name__
+
+    def toggle_selection(self, index):
+        self.selections[index] = not self.selections[index]
+        if self.selections[index] and index in (0, 2):
+            self.selections[2 if index == 0 else 0] = False
 
     def run_report(self, stdscr):
         """Display the existing read-only diagnostic report."""
@@ -126,7 +145,7 @@ class JabberwockyTerminalUI:
                 or jws_installer.CONFIG_DIR
             )
         )
-        core_script = Path(REPO_ROOT) / "scrubber" / "jws_core.py"
+        core_script = Path(REPO_ROOT) / "software" / "macro_manager" / "jws_core.py"
 
         try:
             result = subprocess.run(
@@ -278,7 +297,7 @@ class JabberwockyTerminalUI:
 
     def draw_error_screen(self, stdscr, w, h, message):
         stdscr.clear()
-        self.header(stdscr, w, "SETUP STOPPED — NOTHING WAS BROKEN")
+        self.header(stdscr, w, "SETUP STOPPED — REVIEW DETAILS")
         y = self.wrapped(
             stdscr, 2, 2,
             "Something prevented setup from finishing:", w - 6, curses.A_BOLD
@@ -286,11 +305,28 @@ class JabberwockyTerminalUI:
         y = self.wrapped(stdscr, y + 1, 4, message, w - 8)
         y = self.wrapped(
             stdscr, y + 1, 2,
-            "Your printer.cfg was backed up first (printer_<date>.bak in the config folder). "
-            "Fix the problem above, then run ./install.sh again.",
+            "Preflight conflicts stop before deployment. If a later write failed, earlier "
+            "atomic file updates may already be in place; backups are in jabberwocky_quarantine. "
+            "Resolve the issue above before retrying.",
             w - 6,
         )
         self.safe_addstr(stdscr, y + 1, 2, "Press any key to exit.", curses.A_BOLD)
+        stdscr.refresh()
+        stdscr.getch()
+
+    def draw_jwp_complete(self, stdscr, w, h):
+        stdscr.clear()
+        self.header(stdscr, w, "JWP INSTALL / UPDATE COMPLETE")
+        y = self.wrapped(
+            stdscr, 2, 2,
+            "Local configuration files were updated. This does not verify Klipper startup "
+            "or printer behavior; review the hardware pin and offsets before restarting.",
+            w - 4,
+        )
+        y += 1
+        for note in jws_installer.INSTALL_NOTES:
+            y = self.wrapped(stdscr, y, 4, "- " + note, w - 8)
+        self.safe_addstr(stdscr, min(y + 1, h - 2), 2, "Press any key to return.", curses.A_BOLD)
         stdscr.refresh()
         stdscr.getch()
 
@@ -300,7 +336,12 @@ class JabberwockyTerminalUI:
         bridge = os.path.join(jws_installer.TARGET_DIST_DIR, jws_installer.BRIDGE_FILE)
         checks = (
             ("Dashboard page was created", os.path.isfile(jws_installer.MANAGER_PATH)),
-            ("Sync tool is in place", os.path.isfile(os.path.join(REPO_ROOT, "scrubber", "jws_core.py"))),
+            (
+                "Sync tool is in place",
+                os.path.isfile(
+                    os.path.join(REPO_ROOT, "software", "macro_manager", "jws_core.py")
+                ),
+            ),
             ("Sync button (JABBERWOCKY_SYNC_NOW) installed", os.path.isfile(bridge)),
             ("printer.cfg still exists", os.path.isfile(jws_installer.PRINTER_CFG)),
         )
@@ -374,11 +415,13 @@ class JabberwockyTerminalUI:
             else:
                 steps.append(
                     "4. To turn something off or on: change its 1 or 0, save, then run "
-                    "python3 ~/Jabberwocky-APPS/scrubber/jws_core.py --sync over SSH and restart Klipper."
+                    "python3 ~/Jabberwocky-APPS/software/macro_manager/jws_core.py "
+                    "--sync over SSH and restart Klipper."
                 )
             steps.append(
                 "If Klipper will not start: read the report at the bottom of the dashboard, or run "
-                "python3 ~/Jabberwocky-APPS/scrubber/jws_core.py --report over SSH."
+                "python3 ~/Jabberwocky-APPS/software/macro_manager/jws_core.py "
+                "--report over SSH."
             )
             y = 2
             for step in steps:
@@ -463,7 +506,7 @@ class JabberwockyTerminalUI:
                     if current_row == report_row:
                         message = "Press ENTER to open the report."
                     elif self.options[current_row][2]:
-                        self.selections[current_row] = not self.selections[current_row]
+                        self.toggle_selection(current_row)
                     else:
                         message = "That option is not available yet."
             elif key in (ord("\n"), curses.KEY_ENTER):
@@ -472,21 +515,24 @@ class JabberwockyTerminalUI:
                     continue
                 if current_row < run_row:
                     if self.options[current_row][2]:
-                        self.selections[current_row] = not self.selections[current_row]
+                        self.toggle_selection(current_row)
                     else:
                         message = "That option is not available yet."
                     continue
-                if not self.selections[0]:
-                    message = "Please tick option 1 first (press SPACE on it)."
+                if not (self.selections[0] or self.selections[2]):
+                    message = "Select Macro Manager or Install / Update JWP before starting."
                     continue
                 error = self.run_pipeline(stdscr)
                 if error:
                     self.draw_error_screen(stdscr, w, h, error)
                     break
-                self.draw_verification_pass(stdscr, w, h)
-                self.draw_summary_screen(stdscr, w, h)
-                if self.draw_post_install_screen(stdscr, w, h) == "QUIT":
-                    break
+                if self.selections[0]:
+                    self.draw_verification_pass(stdscr, w, h)
+                    self.draw_summary_screen(stdscr, w, h)
+                    if self.draw_post_install_screen(stdscr, w, h) == "QUIT":
+                        break
+                else:
+                    self.draw_jwp_complete(stdscr, w, h)
             elif key in (ord("q"), ord("Q"), 27):
                 break
 

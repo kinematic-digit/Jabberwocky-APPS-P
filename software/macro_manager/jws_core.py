@@ -1,7 +1,7 @@
 # =====================================================================
 # JWS SYSTEM CORE RUN-LOOP ORCHESTRATOR (jws_core.py)
 # VERSION: 5.9.1 [Read-Only Report Independent of Dashboard and Root File]
-# Location: scrubber/jws_core.py
+# Location: software/macro_manager/jws_core.py
 # =====================================================================
 #!/usr/bin/env python3
 """Jabberwocky Scrubber central orchestration engine.
@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 
 CURRENT_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.abspath(os.path.join(CURRENT_SCRIPT_DIR, ".."))
+REPO_ROOT = os.path.abspath(os.path.join(CURRENT_SCRIPT_DIR, "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
@@ -32,11 +32,11 @@ BUILD_VERSION = "5.9.1"
 RESTART_LOCK_NAME = ".jws_sync_lock"
 RESTART_COOLDOWN_SECONDS = 120
 
-from scrubber.jws_observer import build_inventory, scan
-from scrubber.jws_operator import apply_in_place_masking
-from scrubber.jws_analyzers import run_all
-from scrubber.jws_dashboard import _findings_text
-from scrubber.macro_manager import (
+from software.macro_manager.jws_observer import build_inventory, scan
+from software.macro_manager.jws_operator import apply_in_place_masking
+from software.macro_manager.jws_analyzers import run_all
+from software.macro_manager.jws_dashboard import _findings_text
+from software.macro_manager.macro_manager import (
     MacroManager,
     decode_component_key,
     macro_key_scope,

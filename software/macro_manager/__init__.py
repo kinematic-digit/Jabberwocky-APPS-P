@@ -3,10 +3,9 @@
 # VERSION: 5.9.0
 # =====================================================================
 #!/usr/bin/env python3
-"""Jabberwocky Scrubber (JWS v3.0) Package Initialization Anchor.
+"""Jabberwocky Macro Manager / Scrubber package.
 
-Governs structural package bindings, isolates component visibility, and 
-exposes clean public APIs for multi-module synchronization loops.
+Provides the JWS scanner, dashboard, synchronization, and reporting modules.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from __future__ import annotations
 __version__ = "3.0.0"
 __author__ = "Kinematicdigit (Jabberwocky Team)"
 
-# Enforce clean namespace exposure across the verified layout
+# Public API retained from the original scrubber package.
 __all__ = [
     "SCRIPT_REVISION",
     "SCRIPT_REVISION_DATE",
@@ -33,7 +32,7 @@ from .jws_utils import SCRIPT_REVISION, SCRIPT_REVISION_DATE, IncludeNode
 import importlib
 
 def __getattr__(name: str):
-    """Dynamically import sub‑modules on first attribute access.
+    """Dynamically import submodules on first attribute access.
 
     This keeps the package import lightweight and avoids pulling in
     optional heavy modules when only a subset of the API is required.

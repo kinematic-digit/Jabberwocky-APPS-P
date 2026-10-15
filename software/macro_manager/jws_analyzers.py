@@ -1,7 +1,7 @@
 # =====================================================================
 # JWS ANALYZER REGISTRY (jws_analyzers.py)
 # VERSION: 5.9.0 [Pluggable Hygiene Checks]
-# Location: scrubber/jws_analyzers.py
+# Location: software/macro_manager/jws_analyzers.py
 # =====================================================================
 """Read-only hygiene checks over an Inventory.
 

@@ -13,19 +13,40 @@ python3 ~/printer_data/config/jabberwockyprobe/tools/jwp_config_preflight.py ~/p
 ```
 *Review the generated `~/printer_data/config/jwp_hygiene_report.txt` in Mainsail/Fluidd. Resolve any `[!] BOOT-BLOCKER` or `[!] RUNTIME-ERROR` items before continuing.*
 
-### Step 2 — Add the JWP Include
-Add this single line to your `printer.cfg` (recommended after your stepper/mcu sections):
-```ini
-[include jabberwockyprobe/jwprobe_entry.cfg]
-```
-*(Keep your native `[stepper_x/y/z]` sections. Existing `[quad_gantry_level]`, `[z_tilt]`, and `[bed_mesh]` sections remain active machine geometry; preserve them until the optional leveling-envelope workflow below generates verified replacements.)*
+### Step 2 — Install JWP
+Choose **Install / Update JWP** in the APPS Curses installer. It deploys the
+package, adds the master include when needed, and manages QGL / bed-mesh
+wrappers only for native sections already present. It preserves unrelated
+`printer.cfg` content and backs up changes. Existing native leveling geometry
+remains machine-owned.
 
-**Persistent-data safety:** current JWP versions store live calibration in `~/printer_data/config/jwprobe_runtime_vars.cfg`, deliberately outside the deployable `jabberwockyprobe/` code folder. Updating/replacing that folder therefore cannot erase the machine profile or calibrated positions. If upgrading from an older version whose live `[save_variables]` file was `jabberwockyprobe/jwprobe_vars.cfg` and that file is still intact, copy/rename it to `~/printer_data/config/jwprobe_runtime_vars.cfg` before `FIRMWARE_RESTART` to retain the existing values. The in-folder `jwprobe_vars.cfg` is reference-only and must not be configured as the live database.
+**Persistent-data safety:** live calibration belongs in
+`~/printer_data/config/jwprobe_runtime_vars.cfg`, outside the deployable JWP
+folder. Updates preserve this file byte-for-byte. A legacy-only runtime file
+is copied byte-for-byte and retained as a recovery copy; when both paths exist
+without a verifiable migration record, installation stops and preserves both.
+The reference seed `jwprobe_vars.cfg` is never installed as live data.
 
 **Native leveling geometry is required, but first-time users do not need to guess probing bounds.** JWP loads safely when `[quad_gantry_level]`, `[z_tilt]`, or `[bed_mesh]` is absent and skips the missing feature. After Z calibration, the optional leveling-envelope workflow below visually verifies two diagonal plate locations, accounts for the configured probe X/Y offsets, and prints a copy-ready native configuration. Physical QGL `gantry_corners` or Z-Tilt `z_positions` must still come from the printer manufacturer/CAD because nozzle motion cannot measure where the Z drives attach.
 
 ### Step 3 — Set Your Probe Pin & Offsets
-Open `jabberwockyprobe/jwprobe_hardware.cfg` and set the `pin:` and `x_offset`/`y_offset` for your toolhead board (e.g. `nhk:gpio10` for Nitehawk-36).
+Review `jabberwockyprobe/jwprobe_hardware.cfg` before restarting Klipper.
+Fresh installs seed the project's hardware example; set `pin:` and
+`x_offset`/`y_offset` for your toolhead board (e.g. `nhk:gpio10` for
+Nitehawk-36). Updates preserve an existing hardware file.
+
+### Read-Only KANE Event Capture
+The Install / Update JWP action deploys `jwp_event_tracker.py` to Klipper's
+`klippy/extras` directory and ensures its read-only `[jwp_event_tracker]`
+registration uses the configured `[probe]` pin. The
+`[jwp_event_tracker]` section in `jwprobe_hardware.cfg` observes the existing
+probe switch input; it does not issue printer motion, pause, or shutdown
+commands.
+
+Use `JWP_EVENT_STATUS` and `JWP_EVENT_LOG` to inspect state and the volatile
+30-second event history. Events are not persistent until explicitly committed
+with `JWP_COMMIT_POST_MORTEM LABEL=<label>`, which appends buffered events and
+the manual mark to `jwp_calibration_profile.csv` in the config directory.
 
 ### Step 4 — Run the Onboarding Wizard in Console
 Restart Klipper (`FIRMWARE_RESTART`), then follow the five-step console workflow. Step 5 visually verifies the installed plate position and generates native leveling/mesh geometry:
@@ -88,12 +109,12 @@ Restart Klipper (`FIRMWARE_RESTART`), then follow the five-step console workflow
      JWP_GENERATE_LEVELING_CONFIG MODE=QGL GANTRY_MIN_X=-60 GANTRY_MIN_Y=-10 GANTRY_MAX_X=240 GANTRY_MAX_Y=240
      ```
      For a Z-Tilt machine, first run `JWP_GENERATE_LEVELING_CONFIG MODE=Z_TILT`; it prints the exact command syntax for supplying two to four physical Z-pivot positions. Use `MODE=MESH` when only bed mesh is needed.
-   - In `printer.cfg`, replace the existing `[quad_gantry_level]`, `[z_tilt]`, and/or `[bed_mesh]` section(s) with the emitted text—do not keep both the old and new copies. Enable the matching optional JWP wrapper include(s), then `RESTART` and run `JWP_CONFIG_AUDIT`.
+   - Preserve the existing native `[quad_gantry_level]`, `[z_tilt]`, and/or `[bed_mesh]` settings unless you have verified replacement values. Run **Install / Update JWP** to manage standard QGL/bed-mesh wrappers; Z-tilt remains optional and manual. Then `RESTART` and run `JWP_CONFIG_AUDIT`.
 
    The saved positions are visual checks 5mm inside the plate; JWP reconstructs the estimated plate edges, then applies a separate 20mm physical probing inset. Generated minimum nozzle coordinates also preserve the established JWP front-left cutter clearance (25mm from each axis minimum). JWP cannot discover QGL `gantry_corners` or Z-Tilt `z_positions`; those are physical Z-drive locations, not bed edges. Existing valid manufacturer values should be preserved.
 
 ### Step 6 — Add to `PRINT_START`
-`JWP_PRINT_PREP` internally handles homing, Auto-Z, QGL/Z-Tilt, and Bed Mesh -- do **not** call `G28`, `QUAD_GANTRY_LEVEL`, `Z_TILT_ADJUST`, or `BED_MESH_CALIBRATE` yourself beforehand; JWP intercepts/wraps those commands and runs them internally in the correct order, with correct probe deploy/retract around each one. Remove those calls (and any old Klicky/legacy `G29`/`M420` leftovers) from your slicer's Start G-code entirely.
+`JWP_PRINT_PREP` internally handles homing, Auto-Z, QGL/Z-Tilt, and Bed Mesh -- do **not** call `G28`, `QUAD_GANTRY_LEVEL`, `Z_TILT_ADJUST`, or `BED_MESH_CALIBRATE` yourself beforehand; its JWP-specific print-prep flow runs them internally in the correct order. The installer-managed standard QGL/bed-mesh wrappers provide probe deploy/retract for UI or direct command calls. Remove duplicate leveling calls (and any old Klicky/legacy `G29`/`M420` leftovers) from your slicer's Start G-code.
 
 **Temperature ordering matters** for two reasons specific to this probe: (1) the fixed probe touches the bed for mesh/leveling, so the bed should already be at its *printing* temperature (thermal expansion affects the mesh) before that happens; (2) the Auto-Z step briefly touches the *nozzle* itself to a frame switch, so the hotend should still be cold/low at that point -- a fully-heated nozzle oozes onto the switch and can corrupt the touch reading. Recommended slicer `PRINT_START` structure:
 
@@ -243,17 +264,13 @@ Fixing these checks also required teaching the scanner to actually parse the `#*
 <details>
 <summary><strong>3. Web UI Dashboard Button Overrides (Mainsail & Fluidd)</strong></summary>
 
-Mainsail and Fluidd dashboard buttons execute raw Klipper commands (`QUAD_GANTRY_LEVEL`, `BED_MESH_CALIBRATE`, `Z_TILT_ADJUST`). To make these buttons automatically deploy and retract the Jabberwocky Probe without manual intervention, uncomment the corresponding include lines in `jabberwockyprobe/jwprobe_entry.cfg`:
-
-```ini
-[include jwprobe_qgl.cfg]         # Hooks Mainsail/Fluidd QGL button
-[include jwprobe_bed_mesh.cfg]    # Hooks Mainsail/Fluidd Bed Mesh button
-[include jwprobe_z_tilt.cfg]     # Hooks Mainsail/Fluidd Z-Tilt button
-```
-
-*Note: If your printer lacks a 4-motor gantry or mesh leveling, leave these lines commented; JWP automatically detects absent modules and skips them.*
-
-*Compared to Klicky-Probe (see `macros/debug/config/Klicky/klicky-quad-gantry-level.cfg`): Klicky's QGL button override uses the exact same core mechanism as `jwprobe_qgl.cfg` -- `[gcode_macro QUAD_GANTRY_LEVEL]` with `rename_existing:` pointing at a renamed copy of the native command, so Mainsail/Fluidd's QGL button (and any raw `QUAD_GANTRY_LEVEL` g-code) is transparently intercepted regardless of trigger source. JWP's version forwards the original command's params with `{rawparams}` (a single, order-preserving passthrough) rather than Klicky's manual `{% for p in params %}...{% endfor %}` reconstruction, which is the more robust of the two approaches. Note Klicky's own probe attach/dock calls in that reference file are commented out (`#Attach_Probe` / `#Dock_Probe`) -- JWP's unconditional `DEPLOY_PROBE` call (see comment in `jwprobe_qgl.cfg`) is the actively-maintained equivalent. Because `rename_existing` targets are bound at Klipper's `klippy:connect` stage (after all config sections load), include order relative to your native `[quad_gantry_level]` section does not matter -- but declaring `[gcode_macro QUAD_GANTRY_LEVEL]` twice (e.g. leaving an old Klicky QGL override file included alongside `jwprobe_qgl.cfg`) is a hard duplicate-section config error at boot, not a silent override. If your `QUAD_GANTRY_LEVEL` command still appears to run stock/native behavior with no boot error, the most common cause is simply that `[include jwprobe_qgl.cfg]` is still commented out in your `jwprobe_entry.cfg` -- check that first, then run `FIRMWARE_RESTART` after uncommenting it.*
+Mainsail and Fluidd dashboard buttons call standard Klipper commands. Use
+**Install / Update JWP** in the APPS Curses installer to manage the standard
+QGL and bed-mesh wrappers in a uniquely marked block in `printer.cfg`. The
+installer enables only wrappers whose native sections are configured, places
+them after native definitions, and stops on duplicate or ambiguous wrappers.
+Do not add QGL or bed-mesh wrapper includes to `jwprobe_entry.cfg`. Z-tilt is
+still an optional manual integration and is not managed by this installer.
 
 **Known UX gap — heightmap/mesh-viewer panel "Home" icon:** Mainsail's/Fluidd's dedicated Bed Mesh heightmap panel has its own small home/reset icon in its own toolbar. This is *not* the same as the main dashboard's "Home All" button -- it's a hardcoded frontend action that sends a raw `G28 X Y` (no Z) directly. Even though JWP's `[homing_override]` now captures every `G28` call including this one (see below), the result is the same by design: an `X Y`-only request still only homes `X`/`Y` and leaves `Z` unhomed, because forcing `Z` into every partial home would be wrong behavior, not a fix. If you need `Z` homed before using that panel, run a plain `G28` first (console or main dashboard), then open the heightmap panel.
 
@@ -267,7 +284,7 @@ Mainsail and Fluidd dashboard buttons execute raw Klipper commands (`QUAD_GANTRY
 |---|---|---|
 | `[stepper_x]`, `[stepper_y]`, `[stepper_z]`, MCUs, heaters, fans, kinematics | Old Klicky/Euclid `DEPLOY_PROBE`, `RETRACT_PROBE`, `ATTACH_PROBE`, `DOCK_PROBE` | `jwprobe_hardware.cfg` (`[probe]` pin & offsets) |
 | Native `[quad_gantry_level]`, `[z_tilt]`, `[bed_mesh]` coordinate sections, directly in `printer.cfg` | Old macro overrides that `rename_existing` leveling commands to dock/undock | `jwprobe_globals.cfg` (speeds, currents, tolerances) |
-| Slicer `PRINT_START` / `PRINT_END` | Extra copies of JWP variables or saved coordinates | `jwprobe_runtime_vars.cfg` (auto-persisted calibration, managed by Klipper) |
+| Slicer `PRINT_START` / `PRINT_END` | Extra copies of JWP variables or saved coordinates | The path selected by `[save_variables]` in `jwprobe_entry.cfg`: `~/printer_data/config/jwprobe_runtime_vars.cfg` |
 </details>
 
 <details>
@@ -293,8 +310,8 @@ A passing `JWP_TEST_REPEATABILITY` result is required to trust Auto-Z, but it do
 
 | Data | File Location | Survives Updates? |
 |---|---|---|
-| Calibration results (profile, dock strikes, switch coordinates, offsets, repeatability) | `~/printer_data/config/jwprobe_runtime_vars.cfg` | **Yes** (Persisted via `SAVE_VARIABLE`, outside the deployable JWP folder so updates cannot overwrite it) |
+| Calibration results (profile, dock strikes, switch coordinates, offsets, repeatability) | `~/printer_data/config/jwprobe_runtime_vars.cfg` | Yes; existing bytes are preserved during updates. Legacy-only data is copied and retained as a recovery file. |
 | Native QGL/Z-Tilt geometry and bed-mesh configuration | `~/printer_data/config/printer.cfg` | **Yes** (User-owned, outside the deployable JWP folder) |
 | Hardware pin & probe offsets | `~/printer_data/config/jabberwockyprobe/jwprobe_hardware.cfg` | User editable |
-| Speeds, currents, overshoot tolerances, trust windows | `~/printer_data/config/jabberwockyprobe/jwprobe_globals.cfg` | Framework defaults |
+| Speeds, currents, overshoot tolerances, trust windows | `~/printer_data/config/jabberwockyprobe/jwprobe_globals.cfg` | User/machine-owned; APPS updates do not replace an existing file. |
 </details>

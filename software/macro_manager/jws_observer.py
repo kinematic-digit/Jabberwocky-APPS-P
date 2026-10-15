@@ -1,7 +1,7 @@
 # =====================================================================
 # JWS RECURSIVE TREE CRAWLER AND INVENTORY OBSERVER (jws_observer.py)
 # VERSION: 5.9.0 [Klipper-Order Inventory Crawler]
-# Location: scrubber/jws_observer.py
+# Location: software/macro_manager/jws_observer.py
 # =====================================================================
 #!/usr/bin/env python3
 """Passive, read-only crawler.

@@ -1,7 +1,7 @@
 # =====================================================================
 # JWS SYSTEM MASKING OPERATOR UTILITY LAYER (jws_operator.py)
 # VERSION: 5.9.0 [Plain-# Adoption + Resolved-Path Include Matching]
-# Location: scrubber/jws_operator.py
+# Location: software/macro_manager/jws_operator.py
 # =====================================================================
 #!/usr/bin/env python3
 """Jabberwocky Scrubber structural text in-place masking engine.
@@ -39,6 +39,15 @@ PLAIN_MACRO_HEADER_RE = re.compile(
 )
 COMMENTED_SECTION_RE = re.compile(r"^\s*#+\s*\[")
 SECTION_LINE_RE = re.compile(r"^\[[^\]]+\]")
+JWP_INSTALLER_OWNED_INCLUDES = {
+    "jwprobe_entry.cfg",
+    "jwprobe_qgl.cfg",
+    "jwprobe_bed_mesh.cfg",
+}
+JWP_INSTALLER_OWNED_MACRO_FILES = {
+    "jwprobe_qgl.cfg",
+    "jwprobe_bed_mesh.cfg",
+}
 
 
 def _tail_is_comment(tail: str) -> bool:
@@ -64,6 +73,31 @@ def _include_matches(file_path: Path, target: str, component_name: str, config_d
     resolved = os.path.realpath(os.path.join(str(file_path.parent), target)).lower()
     wanted = os.path.realpath(os.path.join(str(config_dir), component_name)).lower()
     return resolved == wanted
+
+
+def _is_jwp_installer_owned_file(file_path: Path, name: str, config_dir: Path | None) -> bool:
+    if config_dir is None:
+        return False
+    expected = os.path.realpath(
+        os.path.join(str(config_dir), "jabberwockyprobe", name)
+    )
+    return os.path.realpath(file_path) == expected
+
+
+def _is_jwp_installer_owned_include(
+    file_path: Path, target: str, config_dir: Path | None
+) -> bool:
+    if config_dir is None:
+        return False
+    normalized = target.replace("\\", "/")
+    name = Path(normalized).name.lower()
+    if name not in JWP_INSTALLER_OWNED_INCLUDES:
+        return False
+    resolved_target = os.path.realpath(file_path.parent / normalized)
+    expected = os.path.realpath(
+        os.path.join(str(config_dir), "jabberwockyprobe", name)
+    )
+    return resolved_target == expected
 
 
 def _collect_plain_block(lines: list[str], start: int) -> int:
@@ -95,7 +129,11 @@ def _apply_include(lines, file_path, component_name, desired, config_dir, adopt_
     matches = []
     for idx, line in enumerate(lines):
         m = INCLUDE_LINE_RE.match(line)
-        if m and _include_matches(file_path, m.group("target"), component_name, config_dir):
+        if (
+            m
+            and not _is_jwp_installer_owned_include(file_path, m.group("target"), config_dir)
+            and _include_matches(file_path, m.group("target"), component_name, config_dir)
+        ):
             state = _include_state(m)
             if state:
                 matches.append((idx, m, state))
@@ -212,6 +250,12 @@ def apply_in_place_masking(
     desired_state = int(raw_payload)
 
     try:
+        if target_type == "macro" and any(
+            file_path.name.lower() == name
+            and _is_jwp_installer_owned_file(file_path, name, config_dir)
+            for name in JWP_INSTALLER_OWNED_MACRO_FILES
+        ):
+            return False
         lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
         if target_type == "file":
             output, modified = _apply_include(lines, file_path, component_name, desired_state, config_dir, adopt_only)

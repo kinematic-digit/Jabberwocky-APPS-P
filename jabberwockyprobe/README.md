@@ -13,14 +13,15 @@ python3 ~/printer_data/config/jabberwockyprobe/tools/jwp_config_preflight.py ~/p
 ```
 *Review the generated `~/printer_data/config/jwp_hygiene_report.txt` in Mainsail/Fluidd. Resolve any `[!] BOOT-BLOCKER` or `[!] RUNTIME-ERROR` items before continuing.*
 
-### Step 2 — Add the JWP Include
-Add this single line to your `printer.cfg` (must be placed strictly after your stepper motor and MCU definitions):
-```ini
-[include jabberwockyprobe/jwprobe_entry.cfg]
-```
-*(Keep your native `[stepper_x/y/z]` sections. Existing `[quad_gantry_level]`, `[z_tilt]`, and `[bed_mesh]` sections remain active machine geometry; preserve them until the optional leveling-envelope workflow below generates verified replacements.)*
+### Step 2 — Install JWP
+Use **Install / Update JWP** in the APPS Curses installer. It deploys the package,
+adds the master include when needed, and manages QGL / bed-mesh wrappers only
+when the matching native sections are configured. It preserves unrelated
+`printer.cfg` content and backs up changes. Existing native leveling geometry
+remains machine-owned; do not replace it unless you have verified replacement
+values.
 
-**Persistent-Data Safety Net:** Current JWP versions store live calibration data in `~/printer_data/config/jwprobe_runtime_vars.cfg`, deliberately outside the deployable `jabberwockyprobe/` code folder. Updating or replacing that framework directory cannot erase your machine profile or calibrated stroke boundaries. If upgrading from older variants whose live `[save_variables]` path was nested inside `jabberwockyprobe/jwprobe_vars.cfg`, copy or rename that file to `~/printer_data/config/jwprobe_runtime_vars.cfg` before issuing a `FIRMWARE_RESTART` to preserve your records. The internal framework asset `jwprobe_vars.cfg` is now reference-only.
+**Persistent-data safety:** JWP stores live calibration in `~/printer_data/config/jwprobe_runtime_vars.cfg`, outside the deployable code folder. The installer updates code while preserving hardware bindings, user globals, and runtime data. A legacy-only runtime file is copied byte-for-byte to the canonical path and retained as a recovery copy. Fresh installs create an empty `[Variables]` store only when needed; the `jwprobe_vars.cfg` seed is never installed as live data. If both paths exist without a verifiable migration record, installation stops and preserves both.
 
 **Leveling Blueprint Isolation:** JWP loads safely even if `[quad_gantry_level]`, `[z_tilt]`, or `[bed_mesh]` blocks are missing from your configuration by gracefully skipping unconfigured features. After Z calibration is established, the optional leveling-envelope macro visually logs your real plate margins, accounts for your toolhead's active X/Y probe offsets, and outputs copy-ready native layout blocks. Physical `gantry_corners` or `z_positions` parameters must still come from manufacturer specifications or CAD files, as nozzle contact cannot map structural drive pivot points.
 
@@ -184,16 +185,15 @@ python3 ~/printer_data/config/jabberwockyprobe/tools/jwp_config_preflight.py --g
 <details>
 <summary><strong>3. Web UI Dashboard Interception (Mainsail & Fluidd)</strong></summary>
 
-Web interface buttons execute native Klipper commands (`QUAD_GANTRY_LEVEL`, `BED_MESH_CALIBRATE`, `Z_TILT_ADJUST`) directly through backend API loops. To ensure the Jabberwocky Probe automatically manages its deployment profiles whenever these interface buttons are clicked, uncomment the corresponding structural links in `jabberwockyprobe/jwprobe_entry.cfg`:
-
-```ini
-[include jwprobe_qgl.cfg]         ; Seamlessly intercepts Web UI QGL button commands
-[include jwprobe_bed_mesh.cfg]    ; Seamlessly intercepts Web UI Bed Mesh options
-[include jwprobe_z_tilt.cfg]     ; Seamlessly intercepts Web UI Z-Tilt controls
-```
+Web interface buttons call standard Klipper commands. The APPS installer owns
+the generated QGL and bed-mesh includes in a uniquely marked block in
+`printer.cfg`; do not add those wrapper includes to `jwprobe_entry.cfg`.
+Z-tilt remains optional and is not automatically managed.
 
 ### Architectural Implementation Profiles:
-Unlike old macro frameworks that rely on manual parameter parsing loops, JWP routes raw command data through a centralized passthrough layer using `{rawparams}`. This ensures precise tracking of user variables across the connection layer. JWP structures its wrappers as independent, clean commands that execute transparently. Ensure that any conflicting legacy overrides or old Klicky leveling definitions are completely removed from your active files to avoid boot-time duplicate command faults.
+JWP wrappers forward native command parameters with `{rawparams}`. The installer
+checks for competing standard-command wrappers and stops without changing
+`printer.cfg` if ownership is ambiguous.
 </details>
 
 <details>

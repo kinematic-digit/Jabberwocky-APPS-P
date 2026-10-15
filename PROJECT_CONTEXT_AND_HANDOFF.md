@@ -2,6 +2,12 @@
 
 Prepared 2026-10-09 from a read-only reconciliation. **Sections 1–6.6 and 7–9 are static inspection. One isolated runtime test of `jws_core.py --sync` (two runs, fabricated fixture in `/tmp/jw_sync_fixture`) was executed afterward; its observed results are in section 6.7 and labeled [O]. Nothing else was run: no installer, no live config, no Klipper, no UI.**
 
+**Structural update (2026-10-13):** Current Macro Manager source is in
+`software/macro_manager/`; JWP probe runtime source, including KANE, is in
+`software/jw_probe/`. References to `scrubber/` below describe the layout
+observed when this historical handoff was prepared and are not current paths.
+See the repository README for the current source layout.
+
 ## Claim labels used throughout
 
 | Label | Meaning |
@@ -22,6 +28,39 @@ Contradictory reports are kept side by side below. They are not merged into one 
 This file consolidates project context so development can resume without re-running broad audits.
 
 **Readiness: not ready for new feature work (including Choice B).** The mapping, dashboard and synchronization path has been read but not run. Several defects below affect the exact path that Choice B depends on. The 10-Point System Protocol has not been located, and the original Google AI handoff text is not in the repository.
+
+## 1A. Historical context review — stop and notify
+
+Before editing the handoff, inspect the existing project documentation relevant to CANE, collision detection, event tracking, calibration, ADXL, object exclusion, and recovery.
+
+The current discussion may omit previously recorded decisions, implementation details, constraints, experiments, or conclusions.
+
+Your role is to identify relevant historical information, not independently resolve discrepancies between the current discussion and the existing project record.
+
+### Rules
+
+1. Review relevant existing documentation before editing.
+2. Compare the proposed milestone against previously recorded decisions, implementation details, test results, and unresolved questions.
+3. If you discover information that materially conflicts with, contradicts, or changes the interpretation of the current discussion, stop before editing.
+4. Notify the user of the discrepancy. Identify the relevant files or documented evidence, explain the conflict briefly, and ask how to proceed.
+5. Do not silently correct, overwrite, reinterpret, or reconcile conflicting information.
+6. Do not assume that the newest statement is necessarily correct or that older documentation is necessarily authoritative.
+7. Distinguish documented claims, reported test results, actual test evidence, and live-printer verification.
+8. If a previously documented capability appears to have been implemented or a question appears to have been resolved, but its relationship to the proposed milestone is unclear, stop and notify the user.
+9. If historical information is incomplete or ambiguous enough to materially affect the documentation, stop and ask for direction.
+10. Minor wording differences that do not change technical meaning or project decisions do not require stopping.
+11. If no material discrepancy or ambiguity is found, proceed with the requested documentation-only update.
+12. Do not expand this task into a general cleanup or rewrite of historical documentation.
+
+### Reporting
+
+If you stop, report what you found, where you found it, why it conflicts with or materially affects the proposed update, and what decision or clarification is needed. Do not edit the affected milestone documentation until the user provides direction.
+
+If you proceed, report that the historical review was completed and identify any relevant prior decisions or capabilities recovered.
+
+### Governing rule
+
+When project history and the current discussion materially disagree, preserve the existing state of the project and ask the user to decide. Do not resolve the disagreement autonomously.
 
 ---
 
@@ -612,3 +651,461 @@ No demonstrated defect remains that blocks this bounded contract. Known limitati
 
 ### 15.6 Required finish line
 Report: files changed, tests run and actual results, remaining limitations, and a concise physical validation checklist (from `testing_game_plan.md` Stages 1–5: config loads, dock alignment, Auto-Z, collision pin clearance, forced-crash watchdog test, false-trigger check during a print). Then stop and wait for review. Do not continue to ASC.
+
+## 16. JWP recovery and installer verification — 2026-10-13
+
+This addendum records direct source inspection and isolated unit-test results
+after the historical audit above. It supersedes conflicting older status
+statements in sections 15.1–15.4; it does not validate printer runtime behavior.
+
+### 16.1 Verified safeguards and integration
+
+- `software/jws_installer.py` prepares persistence before the general installer
+  deploys the event tracker, backs up `printer.cfg`, or writes dashboard/config
+  outputs. `conflict`, `error`, and `custom` persistence statuses abort that
+  pipeline. The JWP installer separately plans/preflights before backing up and
+  deploying package files or rewriting `printer.cfg`.
+- The canonical JWP runtime store is
+  `~/printer_data/config/jwprobe_runtime_vars.cfg`. Existing canonical data and
+  machine-owned hardware/global files are preserved on update. Legacy data is
+  copied without deleting the source; ambiguous legacy/canonical contents or
+  custom save-variable paths stop automatic installation. The repository seed
+  is excluded from package deployment and release output.
+- QGL and bed-mesh wrapper includes are generated in the marked
+  installer-managed `printer.cfg` block only when the corresponding native
+  sections are found. Duplicate/malformed ownership markers, conflicting
+  wrapper definitions, and third-party claims on
+  `_JWP_NATIVE_QUAD_GANTRY_LEVEL` or
+  `_JWP_NATIVE_BED_MESH_CALIBRATE` stop the JWP preflight. Macro Manager's sync
+  operator protects those managed includes and wrapper files from toggles.
+- These are source-level findings plus fixture tests. Klipper parsing/startup,
+  command registration, and Mainsail/Fluidd button behavior remain unverified.
+
+### 16.2 Regression evidence
+
+- The alias-conflict test in `tests/test_jwp_installation.py` checks each
+  reserved alias using temporary fixtures. It seeds existing package data,
+  canonical variables, the Klipper-extras tracker target, and quarantine data,
+  then asserts the complete config and extras trees are unchanged after
+  preflight rejects the alias.
+- The custom-persistence-path regression in
+  `tests/test_jwp_persistence.py` confirms the general installer rejects the
+  path before tracker deployment and leaves fixture files unchanged.
+- Verified commands on 2026-10-13:
+  `python3 -B -m unittest discover -s tests -p 'test_jwp_installation.py'`
+  passed (15 tests); `python3 -B -m unittest discover -s tests` passed
+  (66 tests). The persistence-focused suite passed separately in the prior
+  verification phase (13 tests). No live printer test was run.
+
+### 16.3 Repository structure, cleanup, and preservation
+
+- Current development sources are under `software/macro_manager/` and
+  `software/jw_probe/`; the installer and release builder are
+  `software/jws_installer.py` and `software/jwp_build.py`. `config/` contains
+  checked-in printer configuration and recovery material; JWP package
+  configuration is also represented under `config/jabberwockyprobe/`.
+- The only safely removable orphan found was the empty, untracked
+  `software/jw_probe/__pycache__/` directory; it was removed. No source,
+  configuration, test, seed, calibration example, or historical record was
+  removed. Tracked `.DS_Store`/bytecode files and tracked `.bak`/rollback
+  backups were retained; some participate in the pending `scrubber/` to
+  `software/` relocation. Empty/unreferenced appearance alone is not grounds
+  for removing remaining project files.
+- Preserve the existing worktree as-is. It contains staged relocation
+  additions/deletions/renames from `scrubber/` into `software/`, additional
+  unstaged edits across documentation/configuration/software/tests, and
+  untracked JWP test files. Some relocated files have both staged relocation
+  state and unstaged content edits. Do not stage, unstage, or clean these as
+  part of follow-up work.
+
+### 16.4 Remaining validation and deployment status
+
+Before any printer deployment, perform a controlled live Klipper config
+preflight/startup and verify the `QUAD_GANTRY_LEVEL` and
+`BED_MESH_CALIBRATE` commands and their Mainsail controls. Review the active
+machine's probe pin and motion/calibration settings independently. No printer
+deployment or Klipper restart has occurred during these audits.
+
+## 17. Next planned milestone — CANE
+
+**CANE = Contextual Awareness Network Events.** The name is finalized.
+
+CANE draws its name and guiding analogy from the physical cane used by a blind
+person to detect obstacles and navigate surroundings. A physical cane helps
+its user notice something that might otherwise go unnoticed; CANE is intended
+to make otherwise unnoticed physical events detectable to printer software,
+preserve their associated context, and make that information available to
+higher-level systems for interpretation and response.
+
+CANE is the event-awareness foundation. Collision detection is its first major
+application, not necessarily the full extent of its future responsibilities.
+Keep the boundaries clear:
+
+- CANE detects and records events and associates them with available context.
+- Higher-level systems interpret evidence and decide what action is
+  appropriate.
+- The broader collision layer will contain additional components and decision
+  mechanisms that have not yet been fully formulated.
+
+Do not imply that CANE's complete architecture or the collision layer is
+already designed.
+
+### 17.1 Milestone status
+
+**CANE — Collision Characterization, Event Localization, and Deferred
+Verification**
+
+**PLANNED — EXISTING IMPLEMENTATION REQUIRES CONFIRMATION ON THE PRINTER. THE
+EXTENDED COLLISION FUNCTIONALITY IS NOT YET IMPLEMENTED OR VERIFIED.**
+
+The user recalls that the earlier CANE/event-tracking implementation worked.
+Preserve that as historical context, not fresh verification. Existing local
+test results do not establish live-printer operation. Confirm the existing
+implementation on the actual printer and build on it where possible; do not
+assume it needs replacement.
+
+### 17.1.1 Historical, source, test, and printer evidence
+
+- **Previously documented:** `JW-APPS_development_handoff.md` describes collision detection as substantially implemented and lists persistent event handling and installation as unfinished acceptance work. This file's section 15.2 records an older watchdog and a separate adaptive tracker that could request impact mitigation; section 15.3 explicitly leaves their relationship and watchdog startup uncertain. These are historical claims, not live verification.
+- **Current source:** `software/jw_probe/jwprobe_logic.cfg` contains watchdog macros, while the current `software/jw_probe/jwp_event_tracker.py` is a separate read-only switch observer with volatile event history and explicit CSV commit. The staged tree shows a 100%-similarity rename of the prior tracker; the unstaged edit replaces its adaptive tracking/mitigation behavior with the current read-only implementation. The deployable logic copy has `initial_duration: 0` and no arming caller in that copy; the configuration copy under `config/jabberwockyprobe/` and `config/start_code.cfg` do contain watchdog arming calls. The sample `config/printer.cfg` includes `start_code.cfg` but comments out the JWP include. The active runtime configuration and canonical source relationship therefore remain unconfirmed.
+- **Actually tested:** the existing `tests/test_jwp_event_tracker.py` suite has previously passed 9 tests using mocks and temporary files. Those tests cover the read-only tracker and installer wiring; they do not execute the watchdog macros or establish live Klipper behavior. No physical-printer test is recorded.
+- **Planned CANE extension:** section 17's fixture-based collision characterization, localization, and deferred-verification work remains planned. Calibration, event-position accuracy, layer/movement attribution, safe checkpoints, intervention thresholds, coverage, ADXL usefulness, and object identity/recovery remain unresolved; proposals are not implemented behavior.
+
+### 17.2 Physical collision-pin calibration
+
+The collision mechanism uses an adjustable M3 button-head cap screw (M3 BHCS).
+A nominal 0.6 mm trigger-height target has been discussed but is theoretical
+until measured. With standard M3 coarse pitch of 0.5 mm, 1.2 turns is nominally
+0.6 mm of axial travel; this calculation is only a starting point, not proof
+of calibration. Actual triggering depends on geometry, switch actuation,
+lever travel, compliance, adjustment direction, and other physical factors.
+
+Plan a printed calibration fixture with known geometry and a known printer
+location, then establish a repeatable procedure to:
+
+- Measure whether the pin triggers at the intended height.
+- Characterize sensitivity, repeatability, contact direction, and harmless
+  trigger susceptibility.
+- Determine which relevant collision conditions the fixture can test.
+- Record results as a baseline for comparison after later changes.
+
+The fixture should also provide a physical reference for event-location and
+layer-attribution tests. Its geometry remains to be designed.
+
+### 17.3 Event capture and contact localization
+
+Capture a suspected collision immediately, before subsequent toolhead motion
+can obscure evidence. The event record should include, where available:
+timestamp, sensor state, toolhead/nozzle position associated with the event,
+estimated physical contact position, calibrated pin-to-nozzle offset, layer
+and movement context, active object identity (only if reliable), subsequent
+classification, verification outcome, and user decision/response.
+
+The nozzle position is not necessarily the physical strike point: account for
+the calibrated spatial offset between nozzle and collision pin. Establish
+whether a sensor transition can be associated with sufficiently accurate
+motion position; querying toolhead position after the event may not recover
+the original contact location if motion has continued.
+
+Use the fixture to compare estimated contact position with actual strike
+location and validate layer/movement attribution. Determine and record
+position-information limitations and uncertainty. Do not present an estimate
+as exact or assume localization has already been demonstrated.
+
+### 17.4 Deferred verification and safety
+
+The preferred initial policy is to capture an event immediately but, when it
+does not indicate immediate danger, defer physical verification until the
+current layer completes and a safe checkpoint is reached. An initial collision
+is not necessarily catastrophic; pausing mid-layer may itself mar the print
+or disrupt printing.
+
+Proposed sequence: detect and record the event/context; estimate contact
+location from the calibrated offset; for events safe to defer, finish the
+layer; reach a defined safe checkpoint; perform controlled verification at
+the estimated location; classify the event as confirmed, dismissed, or
+requiring further investigation; apply the configured response; preserve the
+event and verification outcome.
+
+Severe or sustained collision, suspected mechanical displacement, or other
+immediate danger must not automatically wait until layer completion.
+Conservative immediate-intervention conditions must be defined, but pin
+sensitivity and severity thresholds are unknown; do not invent validated
+thresholds.
+
+An initial development mode should permit user inspection at a safe
+checkpoint. Possible decisions are confirm the collision, dismiss a suspected
+false positive, or request further investigation where supported. Dismissing
+one event must not silently disable detection, alter sensitivity, or suppress
+future events; preserve both the original event and user disposition.
+Record-first, deferred verification, inspection, pause, stop, and eventual
+object-specific recovery are candidate policies, not a settled default or
+implemented feature.
+
+### 17.5 Coverage, periodic checks, and secondary evidence
+
+Characterize possible physical coverage limitations by geometry, contact
+direction, toolhead position, and event class. Distinguish physical coverage
+gaps from classification uncertainty and sensor limitations. Do not assume
+every event without ADXL corroboration is a blind spot; spatial boundaries and
+confidence thresholds require evidence.
+
+Investigate optional periodic checks, particularly for small parts where
+detachment or displacement may compromise a print without an immediate
+collision event. Every two to four layers is a candidate interval only, not a
+validated setting or default. Define a measurable purpose and pass/fail
+criteria before implementation. Evaluate whether a check needs controlled
+motion, contact, position sensing, or another method, and how it can avoid
+print damage/artifacts. User selection is preferred over unconditional
+checking; the activation/configuration mechanism is undecided. Slicer metadata
+or profiles, a Klipper setting/macro, or another architecture-compatible
+mechanism may be investigated, but do not assume slicer integration.
+
+The physical pin is the primary candidate detector. ADXL corroboration is
+unproven: compare accelerometer observations during known collision tests
+against representative normal movement, direction changes, acceleration, and
+resonance. Use ADXL in classification/response only if controlled evidence
+shows reliable additional information; do not make it a prerequisite for CANE
+without a later evidence-based decision.
+
+### 17.6 Object identity and architectural boundaries
+
+Klipper `EXCLUDE_OBJECT` may eventually support recovery of an affected object
+while the rest of a print continues, but accurate contact location does not
+identify the responsible object. Before automatic exclusion, establish how
+object identity is obtained and correlated with event time, layer, movement,
+and contact estimate; determine reliable identification conditions and
+compatibility with Klipper behavior. Handle ambiguity conservatively. Never
+exclude an object merely because it is nearest to the estimated contact point.
+Object exclusion is not required for basic event detection, recording, or
+user inspection.
+
+Keep physical detection, event/context recording and localization,
+classification/confidence, verification, and user-selected response/recovery
+as distinct responsibilities. Do not make CANE monolithic. Collision
+characterization and deferred verification are an initial staging milestone,
+not the full collision-layer specification.
+
+### 17.7 Proposed order of work
+
+1. **Confirm the existing implementation:** inspect actual CANE/event-tracking
+   source and relevant tests, identify what they demonstrate, then confirm
+   basic operation on the printer and record limitations/discrepancies.
+2. **Calibrate physically:** design and use the fixture; measure trigger
+   height, sensitivity, repeatability, and representative contact conditions.
+3. **Validate localization:** verify motion-position association, calibrated
+   offset, contact point, layer, and movement attribution; document limits
+   and uncertainty.
+4. **Define deferred verification:** specify safe checkpoints, immediate
+   intervention exceptions, controlled verification movement and pass/fail
+   criteria, inconclusive-event handling, and inspection/dismissal behavior.
+5. **Characterize coverage and periodic checks:** investigate blind spots,
+   candidate coverage/confidence representation, check purpose/interval and
+   activation.
+6. **Evaluate secondary evidence:** use controlled comparisons to determine
+   whether ADXL adds reliable corroboration and revisit uncertainty handling
+   if it does not.
+7. **Refine response and recovery:** define record/pause/inspect/stop policy
+   and investigate `EXCLUDE_OBJECT` only when identity and recovery conditions
+   are sufficiently reliable.
+
+This order is provisional and may be refined as source inspection and physical
+evidence become available. Do not begin implementation merely from this plan.
+
+### 17.8 Decisions still open
+
+Keep unresolved: actual pin sensitivity; whether 0.6 mm is achievable and
+repeatable; fixture geometry/capability; position-capture timing and accuracy;
+layer/movement attribution; safe checkpoint; verification movement,
+clearances, and pass/fail criteria; immediate-intervention thresholds;
+physical blind spots; ADXL usefulness; periodic-check purpose, interval, and
+activation; slicer feasibility; default response policy; reliable object
+identity and `EXCLUDE_OBJECT` behavior; and additional collision-layer
+components/responsibilities. Do not resolve these by assumption or present
+proposals as established facts.
+
+No printer confirmation is recorded by this plan. Any subsequent physical
+validation requires controlled preflight and explicit evidence; no deployment
+or Klipper restart is authorized or implied here.
+
+## 18. Exploratory architecture pivot — decoupled collision detection
+
+**Status: proposed direction only. Mechanical and architectural feasibility
+have not been established. This section authorizes documentation of the
+exploration, not implementation.**
+
+### 18.1 Purpose and boundaries
+
+Explore collision detection as an independent, native Jabberwocky toolhead
+capability rather than a capability whose availability depends on installing
+JWP. This is not merely a proposal to make JWP's existing collision detector
+optional.
+
+The existing JWP collision pin remains part of the JWP design and should not
+be redesigned or removed by this exploration. JWP remains useful as a probe
+for compatible non-Jabberwocky toolheads. A proposed native detector would
+be a separate capability; its proximity to the nozzle does not by itself
+prove better detection or localization.
+
+Keep responsibilities distinct:
+
+- **Jabberwocky toolhead:** candidate physical detector, mechanical mounting,
+  and electrical interface.
+- **CANE:** event handling and persistence, shared-input multiplexing where
+  required, and making event context available to consumers.
+- **JWP, Klicky, and other probes:** retain normal probe-specific behavior
+  without depending on the native collision detector.
+- **Higher-level collision layer:** interpret event context and determine
+  verification, response, or recovery.
+
+These are conceptual boundaries for investigation, not a claim about the
+architecture currently implemented. CANE is the event-awareness foundation:
+its intended role is to make otherwise unnoticed physical events detectable
+to software, preserve associated context, and expose that information to
+higher-level systems. Collision detection is its first major application,
+not necessarily the limit of its future responsibilities. Do not imply that
+CANE's full architecture or the broader collision layer is already designed;
+do not make CANE a monolithic collision-control subsystem.
+
+### 18.2 Candidate mechanical exploration
+
+Investigate a physical switch near the fan paws, particularly exhaust ports
+close to the nozzle, as one possible location for a detector. A rounded
+contact mechanism, potentially using a ball bearing to transfer force to the
+switch plunger, is only a candidate idea; it is not a finalized design.
+Evaluate detection before damage, contact direction, snag resistance, switch
+travel and actuation force, repeatability, sensitivity, nuisance triggers,
+compliance and recovery, component protection, assembly tolerances, and
+whether installation and calibration can be made reliable.
+
+The existing JWP pin and a proposed fan-paw detector have different physical
+locations and geometries. Do not treat the current JWP pin calibration
+procedure as valid for the new mechanism without separate characterization.
+Do not infer improved localization from detector proximity alone.
+
+### 18.3 Historical and current evidence boundary
+
+Preserve the historical records as distinct. `JW-APPS_development_handoff.md`
+describes collision detection as substantially implemented while listing
+persistent event handling and installation as unfinished acceptance work.
+Section 15.2 of this handoff records a macro watchdog and an older adaptive
+tracker with mitigation behavior; section 15.3 records unresolved questions
+about their relationship and watchdog startup. These historical descriptions
+are not proof of current or printer-verified behavior.
+
+Current source inspection finds separate components: the JWP logic
+configuration contains collision-watchdog macros, and
+`software/jw_probe/jwp_event_tracker.py` is a read-only switch event tracker
+with a volatile 30-second history and explicit CSV commit. The tracker was
+replaced by the current read-only implementation in unstaged edits to the
+relocated file; do not attribute the older adaptive tracker's mitigation
+behavior to the current module. The macro configuration and tracker both
+refer to the probe signal, but no direct source-level call between the
+watchdog and Python tracker was found. This establishes code-level separation,
+not the behavior of a deployed runtime.
+
+The deployable `software/jw_probe/jwprobe_logic.cfg` and configuration copy
+`config/jabberwockyprobe/jwprobe_logic.cfg` differ in watchdog arming paths;
+the latter and `config/start_code.cfg` contain arming calls, while the
+deployable copy's watchdog has `initial_duration: 0` and no caller in that
+copy. The sample `config/printer.cfg` includes `start_code.cfg` but comments
+out the JWP entry include. Which files are active on the physical printer,
+and how the copies are selected or synchronized, remain unverified.
+
+The recorded `tests/test_jwp_event_tracker.py` result is 9 passing tests using
+mocks and temporary files. Those tests exercise read-only event capture,
+history expiry, CSV commit, and installer wiring; they do not execute the
+watchdog macros or prove interaction between the two components. No physical
+printer behavior is verified. See section 17.1.1 for the fuller evidence
+distinction. Do not merge the historical systems or claim either is
+implemented and verified solely because it is documented.
+
+### 18.4 Shared-input and safety investigation
+
+The relevant Nighthawk 36 setup has one available probe input. Current JWP
+hardware configuration registers the event tracker on the existing probe
+pin. A proposed inline collision switch may also affect a shared input, but
+an electrical transition alone may not identify which series switch caused
+it; interpretation depends on circuit, operating state, event handling, and
+timing.
+
+Investigate the circuit, state transitions around printing and probing,
+normal probe behavior, compatibility with JWP and Klicky, and failure modes
+for switches, wires, and connections. Do not assume that ignoring an event
+in software prevents the physical transition from affecting Klipper's probe
+logic. The wiring and state handling must be established and tested. Header,
+connector, and installation requirements are potential design inputs, not
+final specifications.
+
+### 18.5 Relationship to CANE milestone and evidence required
+
+Keep the existing CANE milestone intact: it still covers confirmation of
+current event handling, printer behavior, collision characterization,
+localization and layer/movement attribution, deferred verification and
+inspection, coverage, secondary evidence such as ADXL, periodic checks, and
+eventual response/recovery. The proposed detector is an additional mechanical
+exploration, not a replacement for or retroactive reinterpretation of that
+milestone.
+
+Before treating the pivot as validated, establish the current runtime/source
+relationship and test evidence; characterize the new mechanism independently
+with controlled physical tests; establish input and probe compatibility;
+measure event/context behavior and limitations; and verify Klipper and
+printer behavior on the actual machine. Record each result and its evidence
+level. Do not treat source inspection, mocked tests, or a nominal geometric
+calculation as physical validation.
+
+### 18.6 Open questions
+
+Keep unresolved: whether the fan-paw location is suitable; the contact
+mechanism and snag resistance; switch travel, force, compliance, directional
+coverage, nuisance triggers, and calibration; the final wiring and electrical
+interface; how a shared probe input is observed and multiplexed without
+disrupting normal probing; how transitions near print/probe state changes are
+handled; compatibility with JWP and Klicky; failure modes and safe responses;
+the respective hardware, CANE, probe-software, and higher-level
+interpretation/recovery responsibilities; and what evidence is sufficient to
+validate the architecture.
+
+Do not begin implementation, modify JWP, change wiring, or alter CANE
+implementation from this proposal alone. No printer deployment or Klipper
+restart is authorized or implied.
+
+### 18.7 October 14 discussion addendum — nozzle variation and compatibility
+
+This addendum records the October 14, 2026 discussion in
+`../discussion-Oct14.md`. It adds constraints and goals to the exploration;
+it does not establish implementation, compatibility, or physical validation.
+
+**Nozzle-tip height variation is a mechanical design requirement.** Nozzle
+height varies across nozzle designs and installations. The proposed native
+detector must account for this as part of its physical contact and trigger
+geometry, not treat it solely as a software-offset correction. Investigate
+effects on detection before damage, contact geometry, event-localization
+accuracy, calibration, and compatibility across supported nozzle
+configurations. Establish the supported nozzle and installation range. Do
+not assume a fixed offset or choose a fixed, compliant, adjustable, or other
+solution before evidence supports it. Whether the variation can be handled
+without mechanical adjustment remains unresolved.
+
+**Preserve JWP.** The existing JWP collision pin remains part of JWP's
+design; this exploration does not redesign JWP. JWP remains a probe intended
+for use on other compatible toolheads. The proposed native Jabberwocky
+detector is a separate capability, not an optional replacement for the JWP
+pin.
+
+**CANE and probe compatibility are goals, not verified capabilities.** CANE
+retains persistent event handling and multiplexing as its intended
+responsibilities. Klicky, Voron TAP, and JWP are potential compatibility
+targets; the goal is to preserve their normal probing behavior without
+requiring the probes to become CANE-aware. Compatibility with the proposed
+detector, circuit, and event handling has not been established. Third-party
+reuse of collision detection as an independent toolhead capability, without
+adopting JWP, is a future design objective; no stable third-party
+integration is implemented or verified.
+
+**Mechanical concepts remain exploratory.** The fan paws nearest the nozzle
+are candidate sensor locations, and a ball-bearing contact element is one
+concept for reducing snagging. Neither is selected or validated. Nozzle
+variation, contact geometry, snag resistance, coverage, compatibility, and
+calibration require investigation before design selection.

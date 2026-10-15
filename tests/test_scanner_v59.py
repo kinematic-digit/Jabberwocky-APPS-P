@@ -15,11 +15,11 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from scrubber import jws_core
-from scrubber.jws_analyzers import run_all
-from scrubber.jws_observer import build_inventory
-from scrubber.jws_operator import apply_in_place_masking
-from scrubber.macro_manager import MacroManager
+from software.macro_manager import jws_core
+from software.macro_manager.jws_analyzers import run_all
+from software.macro_manager.jws_observer import build_inventory
+from software.macro_manager.jws_operator import apply_in_place_masking
+from software.macro_manager.macro_manager import MacroManager
 from software import jws_installer
 
 REAL_CONFIG = REPO_ROOT / "config"

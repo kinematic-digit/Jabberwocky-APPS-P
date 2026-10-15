@@ -1,7 +1,7 @@
 # =====================================================================
 # JWS DASHBOARD & REPORT RENDERER (jws_dashboard.py)
 # VERSION: 5.9.0 [Inventory-Driven Dashboard + Evidence-Based Report]
-# Location: scrubber/jws_dashboard.py
+# Location: software/macro_manager/jws_dashboard.py
 # =====================================================================
 """Builds jwt_macro_manager.conf from an Inventory and its findings.
 
@@ -282,7 +282,7 @@ HOW TO USE THIS PAGE:
   4. Save, then run JABBERWOCKY_SYNC_NOW in the Mainsail console. It applies your
      changes and restarts Klipper. A plain restart also applies them.
      If that button is missing, run over SSH:
-       python3 ~/Jabberwocky-APPS/scrubber/jws_core.py --sync
+       python3 ~/Jabberwocky-APPS/software/macro_manager/jws_core.py --sync
      then FIRMWARE_RESTART.
   Hardware blocks (stepper, extruder, mcu ...) are listed for your information only.
 =====================================================================
@@ -315,8 +315,8 @@ HOW TO USE THIS PAGE:
         "  1. Open Mainsail's config editor (it still works) and read the error shown by Klipper.\n"
         "  2. Look at BLOCKERS above. Each one says which file and what to do.\n"
         "  3. Fix the include or macro, or run over SSH:\n"
-        "       python3 ~/Jabberwocky-APPS/scrubber/jws_core.py --report   (read-only check)\n"
-        "       python3 ~/Jabberwocky-APPS/scrubber/jws_core.py --sync     (apply dashboard)\n"
+        "       python3 ~/Jabberwocky-APPS/software/macro_manager/jws_core.py --report   (read-only check)\n"
+        "       python3 ~/Jabberwocky-APPS/software/macro_manager/jws_core.py --sync     (apply dashboard)\n"
         "  4. Then press FIRMWARE RESTART. Backups are in the config folder and in\n"
         "     jabberwocky_quarantine/ (nothing is ever deleted).\n"
     )
