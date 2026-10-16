@@ -49,15 +49,55 @@ def _noop(stage, message=""):
     return None
 
 
+def _unique_backup_file(path):
+    """Reserve a backup filename without replacing an existing recovery file."""
+    path = Path(path)
+    for suffix in range(10000):
+        candidate = path if suffix == 0 else path.with_name(
+            f"{path.stem}_{suffix}{path.suffix}"
+        )
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise RuntimeError(f"Could not allocate a unique backup filename for {path}.")
+
+
+def _unique_backup_directory(path):
+    """Reserve a backup directory without reusing an existing snapshot."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in range(10000):
+        candidate = path if suffix == 0 else path.with_name(f"{path.name}_{suffix}")
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError(f"Could not allocate a unique backup directory for {path}.")
+
+
+def _copy_to_unique_backup(source, destination):
+    destination = _unique_backup_file(destination)
+    try:
+        shutil.copy2(source, destination)
+    except OSError:
+        destination.unlink(missing_ok=True)
+        raise
+    return destination
+
+
 def _backup_files(paths, label):
     """Copy files under quarantine/<label>/<relative path>. Returns the backup folder."""
-    dest_root = os.path.join(QUARANTINE_DIR, label)
+    dest_root = _unique_backup_directory(Path(QUARANTINE_DIR) / label)
     for path in paths:
         rel = os.path.relpath(os.path.realpath(path), os.path.realpath(CONFIG_DIR))
-        dest = os.path.join(dest_root, rel)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        shutil.copy2(path, dest)
-    return dest_root
+        dest = dest_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _copy_to_unique_backup(path, dest)
+    return str(dest_root)
 
 
 def _adopt_plain_comments(inv, book, stamp):
@@ -130,8 +170,12 @@ def run_installation_pipeline(progress=None):
     step("backup", "Saving a safety copy of printer.cfg")
     backup_target = None
     if os.path.exists(PRINTER_CFG):
-        backup_target = os.path.join(CONFIG_DIR, f"printer_{stamp}.bak")
-        shutil.copy2(PRINTER_CFG, backup_target)
+        backup_target = str(
+            _copy_to_unique_backup(
+                PRINTER_CFG,
+                Path(CONFIG_DIR) / f"printer_{stamp}.bak",
+            )
+        )
     os.makedirs(TARGET_DIST_DIR, exist_ok=True)
 
     step("scan", "Reading printer.cfg and following every [include] the way Klipper does")

@@ -16,7 +16,6 @@ from software.jwp_build import JabberwockyCompiler
 
 
 ENTRY_FILES = (
-    REPO_ROOT / "jabberwockyprobe" / "jwprobe_entry.cfg",
     REPO_ROOT / "software" / "jw_probe" / "jwprobe_entry.cfg",
     REPO_ROOT / "config" / "jabberwockyprobe" / "jwprobe_entry.cfg",
 )
@@ -49,7 +48,7 @@ class JWPEntryTests(unittest.TestCase):
                     self.assertTrue((entry.parent / include).is_file(), include)
 
     def test_active_machine_wrapper_choices_are_preserved_in_managed_block(self):
-        entry = ENTRY_FILES[2].read_text(encoding="utf-8")
+        entry = ENTRY_FILES[1].read_text(encoding="utf-8")
         self.assertNotRegex(entry, r"(?m)^\[include jwprobe_(?:qgl|bed_mesh)\.cfg\]$")
         self.assertRegex(entry, r"(?m)^#\[include jwprobe_z_tilt\.cfg\]")
         printer_cfg = (REPO_ROOT / "config" / "printer.cfg").read_text(encoding="utf-8")

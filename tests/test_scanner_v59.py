@@ -50,7 +50,7 @@ class Env:
     def dashboard(self) -> Path:
         return self.root / "jwt_macro_manager.conf"
 
-    def install(self):
+    def install(self, timestamp="20261010_120000"):
         r = self.root
         with contextlib.ExitStack() as stack:
             for name, value in (
@@ -63,7 +63,7 @@ class Env:
             ):
                 stack.enter_context(patch.object(jws_installer, name, value))
             stack.enter_context(patch.object(jws_installer, "_ensure_shell_command_extension", return_value=False))
-            stack.enter_context(patch.object(jws_installer.time, "strftime", return_value="20261010_120000"))
+            stack.enter_context(patch.object(jws_installer.time, "strftime", return_value=timestamp))
             return jws_installer.run_installation_pipeline()
 
     def sync(self, *extra, **env):
@@ -197,6 +197,128 @@ class FindingsTests(unittest.TestCase):
             self.assertTrue(list((e.root / "jabberwocky_quarantine").glob("sweep_*/orphan.cfg")))
             self.assertEqual(MacroManager(e.dashboard).states["action_sweep_to_quarantine"], 0)
             self.assertTrue(list(e.root.glob("printer_*.bak")))  # fresh safety copy is not swept
+
+
+class BackupCollisionTests(unittest.TestCase):
+    def test_printer_backup_collision_preserves_existing_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = Env(tmp)
+            original = "[include a.cfg]\n# original snapshot\n"
+            e.write("printer.cfg", original)
+            e.write("a.cfg", "[gcode_macro A]\ngcode:\n  M117\n")
+
+            e.install("20261014_120000")
+            backup = e.root / "printer_20261014_120000.bak"
+            self.assertEqual(backup.read_text(encoding="utf-8"), original)
+
+            changed = "[include a.cfg]\n# second install source\n"
+            (e.root / "printer.cfg").write_text(changed, encoding="utf-8")
+            e.install("20261014_120000")
+            second_backup = e.root / "printer_20261014_120000_1.bak"
+            self.assertEqual(second_backup.read_text(encoding="utf-8"), changed)
+
+            third = "[include a.cfg]\n# third install source\n"
+            (e.root / "printer.cfg").write_text(third, encoding="utf-8")
+            e.install("20261014_120000")
+
+            self.assertEqual(backup.read_text(encoding="utf-8"), original)
+            self.assertEqual(second_backup.read_text(encoding="utf-8"), changed)
+            self.assertEqual(
+                (e.root / "printer_20261014_120000_2.bak").read_text(encoding="utf-8"),
+                third,
+            )
+
+    def test_adoption_backup_collision_preserves_existing_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = Env(tmp)
+            source = e.write("printer.cfg", "# first adoption source\n")
+            quarantine = e.root / "jabberwocky_quarantine"
+            backup = quarantine / "adopt_backup_20261014_120000" / "printer.cfg"
+
+            with (
+                patch.object(jws_installer, "CONFIG_DIR", str(e.root)),
+                patch.object(jws_installer, "QUARANTINE_DIR", str(quarantine)),
+            ):
+                jws_installer._backup_files([str(source)], "adopt_backup_20261014_120000")
+                self.assertEqual(backup.read_text(encoding="utf-8"), "# first adoption source\n")
+
+                source.write_text("# second adoption source\n", encoding="utf-8")
+                jws_installer._backup_files([str(source)], "adopt_backup_20261014_120000")
+                source.write_text("# third adoption source\n", encoding="utf-8")
+                jws_installer._backup_files([str(source)], "adopt_backup_20261014_120000")
+
+            self.assertEqual(backup.read_text(encoding="utf-8"), "# first adoption source\n")
+            self.assertEqual(
+                (quarantine / "adopt_backup_20261014_120000_1" / "printer.cfg")
+                .read_text(encoding="utf-8"),
+                "# second adoption source\n",
+            )
+            self.assertEqual(
+                (quarantine / "adopt_backup_20261014_120000_2" / "printer.cfg")
+                .read_text(encoding="utf-8"),
+                "# third adoption source\n",
+            )
+
+
+class IncludeTraversalTests(unittest.TestCase):
+    def _env(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Env(tmp.name)
+
+    def test_recursive_macroless_file_is_loaded_not_orphaned(self):
+        e = self._env()
+        e.write("printer.cfg", "[include sub/inner.cfg]\n")
+        e.write("sub/inner.cfg", "[include leaf.cfg]\n")
+        leaf = e.write("sub/leaf.cfg", "[printer]\nkinematics: none\n")
+
+        inv = build_inventory(e.root / "printer.cfg", e.root)
+        findings = run_all(inv)
+
+        self.assertIn(str(leaf.resolve()), inv.live_files())
+        self.assertNotIn(
+            "sub/leaf.cfg",
+            [rel for finding in findings if finding.code == "FILE_ORPHAN" for rel in finding.files],
+        )
+
+    def test_unreachable_file_include_is_not_traversed(self):
+        e = self._env()
+        e.write("printer.cfg", "[include active.cfg]\n")
+        e.write("active.cfg", "[gcode_macro ACTIVE]\ngcode:\n  M117\n")
+        unreachable = e.write("unreachable.cfg", "[include hidden.cfg]\n")
+        hidden = e.write("hidden.cfg", "[gcode_macro HIDDEN]\ngcode:\n  M117\n")
+
+        inv = build_inventory(e.root / "printer.cfg", e.root)
+
+        self.assertNotIn(str(unreachable.resolve()), inv.files)
+        self.assertNotIn(str(hidden.resolve()), inv.files)
+        self.assertNotIn(str(unreachable.resolve()), inv.texts)
+        self.assertNotIn(str(unreachable.resolve()), [ref.parent for ref in inv.includes])
+        self.assertEqual([macro.name for macro in inv.macros], ["ACTIVE"])
+
+    def test_cyclic_includes_terminate_and_inventory_each_file_once(self):
+        e = self._env()
+        root = e.write("printer.cfg", "[include a.cfg]\n")
+        a = e.write("a.cfg", "[include b.cfg]\n[gcode_macro A]\ngcode:\n  M117\n")
+        b = e.write("b.cfg", "[include a.cfg]\n[gcode_macro B]\ngcode:\n  M117\n")
+
+        inv = build_inventory(root, e.root)
+
+        self.assertEqual(set(inv.files), {str(root.resolve()), str(a.resolve()), str(b.resolve())})
+        self.assertEqual(len(inv.includes), 3)
+        self.assertEqual({macro.name for macro in inv.macros}, {"A", "B"})
+        self.assertEqual(len(inv.macros), 2)
+
+    def test_duplicate_include_references_do_not_duplicate_parsed_contents(self):
+        e = self._env()
+        root = e.write("printer.cfg", "[include shared.cfg]\n[include shared.cfg]\n")
+        shared = e.write("shared.cfg", "[gcode_macro SHARED]\ngcode:\n  M117\n")
+
+        inv = build_inventory(root, e.root)
+
+        self.assertEqual(len(inv.includes), 2)
+        self.assertEqual(set(inv.files), {str(root.resolve()), str(shared.resolve())})
+        self.assertEqual([macro.name for macro in inv.macros], ["SHARED"])
 
 
 class RestartTests(unittest.TestCase):

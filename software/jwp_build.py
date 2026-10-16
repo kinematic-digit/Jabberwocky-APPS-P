@@ -58,15 +58,3 @@ class JabberwockyCompiler:
             
         print(f"🚀 Success: Optimized production asset generated cleanly ({len(release_content)} compiled rows).")
         return True
-
-if __name__ == "__main__":
-    # Example execution paths for compiling separate product modules
-    print("📦 Initializing Jabberwocky Compilation Pipeline...")
-    
-    # Pack Toolhead Release
-    jwt_compiler = JabberwockyCompiler("config_src/jwt_toolhead", "jabberwocky_release")
-    jwt_compiler.compile_release_package("jwt_production.cfg")
-    
-    # Pack Probe Release
-    jwp_compiler = JabberwockyCompiler("config_src/jwp_probe", "jabberwocky_release")
-    jwp_compiler.compile_release_package("jwp_production.cfg")
